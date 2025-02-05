@@ -1461,6 +1461,7 @@ static const char * const damon_sysfs_damos_action_strs[] = {
 	"migrate_hot",
 	"migrate_cold",
 	"stat",
+	"colloid_basic",
 };
 
 static struct damon_sysfs_scheme *damon_sysfs_scheme_alloc(

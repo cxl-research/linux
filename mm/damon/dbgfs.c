@@ -1060,6 +1060,124 @@ static ssize_t dbgfs_monitor_on_write(struct file *file,
 	return ret;
 }
 
+static ssize_t damon_dbgfs_pebs_cpus_read(struct file *file,
+			char __user *buf, size_t count, loff_t *ppos)
+{
+	struct cpumask *mask;
+	char *kbuf;
+	int len;
+	ssize_t ret;
+
+	mask = kzalloc(sizeof(struct cpumask), GFP_KERNEL | __GFP_NOWARN);
+	if (!mask) {
+		ret = -ENOMEM;
+		goto out_mask;
+	}
+
+	kbuf = kzalloc(512, GFP_KERNEL | __GFP_NOWARN);
+	if (!kbuf) {
+		ret = -ENOMEM;
+		goto out_buf;
+	}
+
+	damon_get_pebs_cpus(mask);
+	len = scnprintf(kbuf, 511, "%*pbl\n", cpumask_pr_args(mask));
+	ret =  simple_read_from_buffer(buf, count, ppos, kbuf, len);
+out_buf:
+	kfree(kbuf);
+out_mask:
+	kfree(mask);
+	return ret;
+}
+
+static ssize_t damon_dbgfs_pebs_cpus_write(struct file *file,
+			const char __user *buf, size_t count, loff_t *ppos)
+{
+	struct cpumask *mask;
+	ssize_t ret, ret2;
+	char *kbuf;
+
+	if (*ppos)
+		return -EINVAL;
+
+	mask = kzalloc(sizeof(struct cpumask), GFP_KERNEL | __GFP_NOWARN);
+	if (!mask) {
+		ret = -ENOMEM;
+		goto out_mask;
+	}
+
+	kbuf = kzalloc(count + 1, GFP_KERNEL | __GFP_NOWARN);
+	if (!kbuf) {
+		ret = -ENOMEM;
+		goto out_buf;
+	}
+
+	ret2 = simple_write_to_buffer(kbuf, count + 1, ppos, buf, count);
+	if (ret2 != count) {
+		ret = -EIO;
+		goto out_buf;
+	}
+	kbuf[ret2] = '\0';
+
+	/* Remove white space */
+	if (sscanf(kbuf, "%s", kbuf) != 1) {
+		ret = -EINVAL;
+		goto out_buf;
+	}
+
+	ret = cpulist_parse(kbuf, mask);
+	damon_set_pebs_cpus(mask);
+
+	if (!ret)
+		ret = count;
+
+out_buf:
+	kfree(kbuf);
+out_mask:
+	kfree(mask);
+	return ret;
+}
+
+static ssize_t damon_dbgfs_pebs_freq_read(struct file *file,
+			char __user *buf, size_t count, loff_t *ppos)
+{
+	char kbuf[8];
+	int len, freq;
+
+	freq = damon_get_pebs_freq();
+	len = scnprintf(kbuf, 8, "%d\n", freq);
+	return simple_read_from_buffer(buf, count, ppos, kbuf, len);
+}
+
+static ssize_t damon_dbgfs_pebs_freq_write(struct file *file,
+			const char __user *buf, size_t count, loff_t *ppos)
+{
+	int freq;
+	ssize_t ret;
+	char kbuf[8];
+
+	if (*ppos)
+		return -EINVAL;
+
+	ret = simple_write_to_buffer(kbuf, count + 1, ppos, buf, count);
+	if (ret != count) {
+		return -EIO;
+	}
+	kbuf[ret] = '\0';
+
+	/* Remove white space */
+	if (sscanf(kbuf, "%d", &freq) != 1) {
+		return -EINVAL;
+	}
+
+	ret = damon_set_pebs_freq(freq);
+
+	if (!ret)
+		ret = count;
+
+	return ret;
+}
+
 static int damon_dbgfs_static_file_open(struct inode *inode, struct file *file)
 {
 	damon_dbgfs_warn_deprecation();
@@ -1086,13 +1204,26 @@ static const struct file_operations monitor_on_fops = {
 	.write = dbgfs_monitor_on_write,
 };
 
+static const struct file_operations pebs_cpus_fops = {
+	.open = damon_dbgfs_static_file_open,
+	.read = damon_dbgfs_pebs_cpus_read,
+	.write = damon_dbgfs_pebs_cpus_write,
+};
+
+static const struct file_operations pebs_freq_fops = {
+	.open = damon_dbgfs_static_file_open,
+	.read = damon_dbgfs_pebs_freq_read,
+	.write = damon_dbgfs_pebs_freq_write,
+};
+
 static int __init __damon_dbgfs_init(void)
 {
 	struct dentry *dbgfs_root;
 	const char * const file_names[] = {"mk_contexts", "rm_contexts",
-		"monitor_on_DEPRECATED", "DEPRECATED"};
+		"monitor_on_DEPRECATED", "DEPRECATED", "pebs_cpus", "pebs_freq"};
 	const struct file_operations *fops[] = {&mk_contexts_fops,
-		&rm_contexts_fops, &monitor_on_fops, &deprecated_fops};
+		&rm_contexts_fops, &monitor_on_fops, &deprecated_fops,
+		&pebs_cpus_fops, &pebs_freq_fops};
 	int i;
 
 	dbgfs_root = debugfs_create_dir("damon", NULL);

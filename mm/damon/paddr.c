@@ -10,6 +10,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/page_idle.h>
 #include <linux/pagemap.h>
+#include <linux/pagewalk.h>
 #include <linux/rmap.h>
 #include <linux/swap.h>
 #include <linux/memory-tiers.h>
@@ -18,6 +19,16 @@
 
 #include "../internal.h"
 #include "ops-common.h"
+
+static const uint64_t DAMON_PEBS_EVENTS[] = {
+	LLC_MISS_LOADS_EVENT,
+	ALL_STORES_EVENT
+};
+
+struct aggregation_metadata {
+	unsigned int max_nr_samples;
+	unsigned int max_sample_period_sum;
+} metapebs;
 
 static bool damon_folio_mkold_one(struct folio *folio,
 		struct vm_area_struct *vma, unsigned long addr, void *arg)
@@ -56,35 +67,6 @@ static void damon_folio_mkold(struct folio *folio)
 	if (need_lock)
 		folio_unlock(folio);
 
-}
-
-static void damon_pa_mkold(unsigned long paddr)
-{
-	struct folio *folio = damon_get_folio(PHYS_PFN(paddr));
-
-	if (!folio)
-		return;
-
-	damon_folio_mkold(folio);
-	folio_put(folio);
-}
-
-static void __damon_pa_prepare_access_check(struct damon_region *r)
-{
-	r->sampling_addr = damon_rand(r->ar.start, r->ar.end);
-
-	damon_pa_mkold(r->sampling_addr);
-}
-
-static void damon_pa_prepare_access_checks(struct damon_ctx *ctx)
-{
-	struct damon_target *t;
-	struct damon_region *r;
-
-	damon_for_each_target(t, ctx) {
-		damon_for_each_region(r, t)
-			__damon_pa_prepare_access_check(r);
-	}
 }
 
 static bool damon_folio_young_one(struct folio *folio,
@@ -148,54 +130,119 @@ static bool damon_folio_young(struct folio *folio)
 	return accessed;
 }
 
-static bool damon_pa_young(unsigned long paddr, unsigned long *folio_sz)
+static void __damon_pa_check_access(struct damon_region *r,
+			struct damon_attrs *attrs, struct damon_pebs_sample *s)
 {
-	struct folio *folio = damon_get_folio(PHYS_PFN(paddr));
-	bool accessed;
+	r->nr_pebs_samples++;
+	r->pebs_sample_period_sum += s->period;
 
-	if (!folio)
-		return false;
-
-	accessed = damon_folio_young(folio);
-	*folio_sz = folio_size(folio);
-	folio_put(folio);
-	return accessed;
+	if (r->nr_pebs_samples > metapebs.max_nr_samples)
+		metapebs.max_nr_samples = r->nr_pebs_samples;
+	if (r->pebs_sample_period_sum > metapebs.max_sample_period_sum)
+		metapebs.max_sample_period_sum = r->pebs_sample_period_sum;
 }
 
-static void __damon_pa_check_access(struct damon_region *r,
-		struct damon_attrs *attrs)
+static bool __damon_pa_check_access_sample(struct damon_ctx *ctx,
+			struct damon_pebs_sample *sample)
 {
-	static unsigned long last_addr;
-	static unsigned long last_folio_sz = PAGE_SIZE;
-	static bool last_accessed;
+	struct damon_target *t;
+	struct damon_region *r;
 
-	/* If the region is in the last checked page, reuse the result */
-	if (ALIGN_DOWN(last_addr, last_folio_sz) ==
-				ALIGN_DOWN(r->sampling_addr, last_folio_sz)) {
-		damon_update_region_access_rate(r, last_accessed, attrs);
-		return;
+	damon_for_each_target(t, ctx) {
+		damon_for_each_region(r, t) {
+			if (r->ar.start <= sample->phys_addr && sample->phys_addr < r->ar.end) {
+				__damon_pa_check_access(r, &ctx->attrs, sample);
+				return true;
+			}
+		}
 	}
 
-	last_accessed = damon_pa_young(r->sampling_addr, &last_folio_sz);
-	damon_update_region_access_rate(r, last_accessed, attrs);
+	return false;
+}
 
-	last_addr = r->sampling_addr;
+static unsigned int damon_update_nr_accesses(struct damon_ctx *ctx)
+{
+	struct damon_target *t;
+	struct damon_region *r;
+	unsigned int max_nr_accesses = 0, factor;
+
+	factor = ctx->attrs.aggr_interval / \
+			(ctx->attrs.sample_interval ?  ctx->attrs.sample_interval : 1);
+	damon_for_each_target(t, ctx) {
+		damon_for_each_region(r, t) {
+			unsigned int incbp = factor * (metapebs.max_nr_samples ? \
+					(10000 * r->nr_pebs_samples / metapebs.max_nr_samples) : 0);
+			unsigned int decbp = 10000 * r->last_nr_accesses;
+			int delta = incbp - decbp;
+
+			if (delta + r->nr_accesses_bp <= 0)
+				r->nr_accesses_bp = 0;
+			else
+				r->nr_accesses_bp += delta;
+
+			r->nr_accesses = r->nr_accesses_bp / 10000;
+			max_nr_accesses = max(r->nr_accesses, max_nr_accesses);
+			r->nr_pebs_samples = 0;
+			r->pebs_sample_period_sum = 0;
+		}
+	}
+
+	metapebs.max_nr_samples = 0;
+	metapebs.max_sample_period_sum = 0;
+
+	return max_nr_accesses;
 }
 
 static unsigned int damon_pa_check_accesses(struct damon_ctx *ctx)
 {
-	struct damon_target *t;
-	struct damon_region *r;
-	unsigned int max_nr_accesses = 0;
+	unsigned int sample_batchsz = 1000, ret = 0, nr_samples;
+	unsigned long sample_period_sum = 0;
+	struct damon_pebs_sample *sample;
+	struct perf_event *event;
+	struct cpumask *cpumask;
 
-	damon_for_each_target(t, ctx) {
-		damon_for_each_region(r, t) {
-			__damon_pa_check_access(r, &ctx->attrs);
-			max_nr_accesses = max(r->nr_accesses, max_nr_accesses);
+	cpumask = kzalloc(sizeof(struct cpumask), GFP_KERNEL | __GFP_NOWARN);
+	if (!cpumask) {
+		goto out_mask;
+	}
+	damon_get_pebs_cpus(cpumask);
+
+	for (int ev = 0; ev < NR_DAMON_PEBS_EVENTS; ++ev) {
+		int cpu = -1;
+		while ((cpu = cpumask_next(cpu, cpumask)) < MAX_PEBS_CPUS) {
+			/* Read PEBS data */
+			int pos = ev * MAX_PEBS_CPUS + cpu;
+			event = *(ctx->pebs_ctx.pebs_events + pos);
+			__sync_synchronize();
+
+			ret = perf_setup_event_for_reading(event);
+			if (ret)
+				continue;
+
+			for (int i = 0; i < sample_batchsz; ++i) {
+				sample = perf_get_event_sample(&ret);
+				if (ret == -ENOENT) {
+					/* No more samples in buffer */
+					break;
+				} else if (ret == -EINVAL) {
+					/* Bad sample; skipping */
+					goto put_sample;
+				}
+
+				if(__damon_pa_check_access_sample(ctx, sample)) {
+					sample_period_sum += sample->period;
+					++nr_samples;
+				}
+put_sample:
+				smp_mb();
+				perf_put_event_sample();
+			}
+			perf_free_event_reader();
 		}
 	}
 
-	return max_nr_accesses;
+out_mask:
+	return 0;
 }
 
 static bool __damos_pa_filter_out(struct damos_filter *filter,
@@ -412,7 +459,7 @@ keep:
 	return nr_migrated;
 }
 
-static unsigned long damon_pa_migrate_pages(struct list_head *folio_list,
+unsigned long damon_pa_migrate_pages(struct list_head *folio_list,
 					    int target_nid)
 {
 	int nid;
@@ -451,8 +498,9 @@ static unsigned long damon_pa_migrate_pages(struct list_head *folio_list,
 
 static unsigned long damon_pa_migrate(struct damon_region *r, struct damos *s)
 {
-	unsigned long addr, applied;
-	LIST_HEAD(folio_list);
+	unsigned long addr, applied2, applied3, nid = 2;
+	LIST_HEAD(folio_list_2);
+	LIST_HEAD(folio_list_3);
 
 	for (addr = r->ar.start; addr < r->ar.end; addr += PAGE_SIZE) {
 		struct folio *folio = damon_get_folio(PHYS_PFN(addr));
@@ -465,13 +513,18 @@ static unsigned long damon_pa_migrate(struct damon_region *r, struct damos *s)
 
 		if (!folio_isolate_lru(folio))
 			goto put_folio;
-		list_add(&folio->lru, &folio_list);
+		if (nid == 2)
+			list_add(&folio->lru, &folio_list_2);
+		else
+			list_add(&folio->lru, &folio_list_3);
+		nid = (nid == 2) ? 3 : 2;
 put_folio:
 		folio_put(folio);
 	}
-	applied = damon_pa_migrate_pages(&folio_list, s->target_nid);
+	applied2 = damon_pa_migrate_pages(&folio_list_2, 2);
+	applied3 = damon_pa_migrate_pages(&folio_list_3, 3);
 	cond_resched();
-	return applied * PAGE_SIZE;
+	return (applied2 + applied3) * PAGE_SIZE;
 }
 
 
@@ -488,6 +541,7 @@ static unsigned long damon_pa_apply_scheme(struct damon_ctx *ctx,
 		return damon_pa_deactivate_pages(r, scheme);
 	case DAMOS_MIGRATE_HOT:
 	case DAMOS_MIGRATE_COLD:
+	case DAMOS_COLLOID_BASIC:
 		return damon_pa_migrate(r, scheme);
 	case DAMOS_STAT:
 		break;
@@ -510,6 +564,7 @@ static int damon_pa_scheme_score(struct damon_ctx *context,
 	case DAMOS_LRU_DEPRIO:
 		return damon_cold_score(context, r, scheme);
 	case DAMOS_MIGRATE_HOT:
+	case DAMOS_COLLOID_BASIC:
 		return damon_hot_score(context, r, scheme);
 	case DAMOS_MIGRATE_COLD:
 		return damon_cold_score(context, r, scheme);
@@ -520,20 +575,72 @@ static int damon_pa_scheme_score(struct damon_ctx *context,
 	return DAMOS_MAX_SCORE;
 }
 
+static void damon_pa_init(struct damon_ctx *ctx)
+{
+	struct cpumask *cpumask;
+
+	cpumask = kzalloc(sizeof(struct cpumask), GFP_KERNEL | __GFP_NOWARN);
+	if (!cpumask)
+		return;
+	damon_get_pebs_cpus(cpumask);
+
+	ctx->pebs_ctx.pebs_attrs.sample_freq = damon_get_pebs_freq();
+	ctx->pebs_ctx.pebs_events = kzalloc(sizeof(struct perf_event *) * \
+			MAX_PEBS_CPUS * NR_DAMON_PEBS_EVENTS, GFP_KERNEL | __GFP_NOWARN);
+
+	for (int ev = 0; ev < NR_DAMON_PEBS_EVENTS; ++ev) {
+		int cpu = -1;
+		while ((cpu = cpumask_next(cpu, cpumask)) < MAX_PEBS_CPUS) {
+			int pos = ev * MAX_PEBS_CPUS + cpu;
+			int ret = perf_event_init_from_kernel(&(ctx->pebs_ctx.pebs_events[pos]),
+			PEBS_SAMPLE_TYPE, DAMON_PEBS_EVENTS[ev], cpu, PEBS_EVENT_PAGES,
+			ctx->pebs_ctx.pebs_attrs.sample_freq);
+			if (ret)
+				printk(KERN_ERR
+						"[DAMON_PEBS] %d: Failed to initialize event %d on CPU %d\n",
+						ret, ev, cpu);
+		}
+	}
+
+	metapebs.max_nr_samples = 0;
+	metapebs.max_sample_period_sum = 0;
+}
+
+static void damon_pa_cleanup(struct damon_ctx *ctx)
+{
+	if (!ctx->pebs_ctx.pebs_events)
+		return;
+
+	for (int ev = 0; ev < NR_DAMON_PEBS_EVENTS; ++ev) {
+		for (int cpu = 0; cpu < MAX_PEBS_CPUS; ++cpu) {
+			int pos = ev * MAX_PEBS_CPUS + cpu;
+			if (!ctx->pebs_ctx.pebs_events[pos])
+				continue;
+			perf_event_release_kernel(ctx->pebs_ctx.pebs_events[pos]);
+		}
+	}
+	kfree(ctx->pebs_ctx.pebs_events);
+	ctx->pebs_ctx.pebs_events = NULL;
+}
+
 static int __init damon_pa_initcall(void)
 {
 	struct damon_operations ops = {
 		.id = DAMON_OPS_PADDR,
-		.init = NULL,
+		.init = damon_pa_init,
 		.update = NULL,
-		.prepare_access_checks = damon_pa_prepare_access_checks,
+		.prepare_access_checks = NULL,
 		.check_accesses = damon_pa_check_accesses,
+		.pre_aggregation = damon_update_nr_accesses,
 		.reset_aggregated = NULL,
 		.target_valid = NULL,
-		.cleanup = NULL,
+		.cleanup = damon_pa_cleanup,
 		.apply_scheme = damon_pa_apply_scheme,
 		.get_scheme_score = damon_pa_scheme_score,
 	};
+
+	damon_set_pebs_freq(PEBS_FREQ);
+	damon_setall_pebs_cpus();
 
 	return damon_register_ops(&ops);
 };

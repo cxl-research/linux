@@ -32,6 +32,35 @@ static struct damon_operations damon_registered_ops[NR_DAMON_OPS];
 
 static struct kmem_cache *damon_region_cache __ro_after_init;
 
+static int damon_pebs_freq;
+static struct cpumask damon_pebs_cpus;
+
+int damon_get_pebs_freq(void)
+{
+	return damon_pebs_freq;
+}
+
+int damon_set_pebs_freq(int freq)
+{
+	damon_pebs_freq = freq;
+	return 0;
+}
+
+void damon_get_pebs_cpus(struct cpumask *mask)
+{
+	cpumask_copy(mask, &damon_pebs_cpus);
+}
+
+void damon_set_pebs_cpus(struct cpumask *mask)
+{
+	cpumask_copy(&damon_pebs_cpus, mask);
+}
+
+void damon_setall_pebs_cpus(void)
+{
+	cpumask_setall(&damon_pebs_cpus);
+}
+
 /* Should be called under damon_ops_lock with id smaller than NR_DAMON_OPS */
 static bool __damon_is_registered_ops(enum damon_ops_id id)
 {
@@ -134,6 +163,9 @@ struct damon_region *damon_new_region(unsigned long start, unsigned long end)
 
 	region->age = 0;
 	region->last_nr_accesses = 0;
+
+	region->nr_pebs_samples = 0;
+	region->pebs_sample_period_sum = 0;
 
 	return region;
 }
@@ -895,7 +927,7 @@ static struct damon_target *damon_nth_target(int n, struct damon_ctx *ctx)
  * 1. valid (end >= src) and
  * 2. sorted by starting address.
  *
- * If @src has no region, @dst keeps current regions.
+ * If @src has no region, @dst regions initialized.
  */
 static int damon_commit_target_regions(
 		struct damon_target *dst, struct damon_target *src)
@@ -906,8 +938,22 @@ static int damon_commit_target_regions(
 
 	damon_for_each_region(src_region, src)
 		i++;
-	if (!i)
-		return 0;
+	if (!i) {
+		/* no region in src, keep ranges same if target is same */
+		if (src->pid == dst->pid)
+			return 0;
+
+		/* else reinitialize from three largest maps */
+		ranges = kmalloc_array(3, sizeof(*ranges),
+					GFP_KERNEL | __GFP_NOWARN);
+		if (!ranges)
+			return -ENOMEM;
+		err = damon_va_three_regions(src, ranges);
+		if (err)
+			goto err_noset;
+		i = 3;
+		goto set_regions;
+	}
 
 	ranges = kmalloc_array(i, sizeof(*ranges), GFP_KERNEL | __GFP_NOWARN);
 	if (!ranges)
@@ -915,7 +961,9 @@ static int damon_commit_target_regions(
 	i = 0;
 	damon_for_each_region(src_region, src)
 		ranges[i++] = src_region->ar;
+set_regions:
 	err = damon_set_regions(dst, ranges, i);
+err_noset:
 	kfree(ranges);
 	return err;
 }
@@ -1177,6 +1225,9 @@ static void kdamond_reset_aggregated(struct damon_ctx *c)
 			trace_damon_aggregated(ti, r, damon_nr_regions(t));
 			r->last_nr_accesses = r->nr_accesses;
 			r->nr_accesses = 0;
+			r->nr_accesses = r->nr_accesses_bp / 10000;
+			r->nr_pebs_samples = 0;
+			r->pebs_sample_period_sum = 0;
 		}
 		ti++;
 	}
@@ -1341,6 +1392,84 @@ static bool damos_filter_out(struct damon_ctx *ctx, struct damon_target *t,
 	return false;
 }
 
+static inline u64 read_cha_msr(u64 msrnum)
+{
+	u32 hi, lo;
+	rdmsr_on_cpu(COLLOID_MON_CORE, msrnum, &lo, &hi);
+	return ((u64)hi << 32) | lo;
+}
+
+static bool latency_dram_gt_cxl(unsigned long si)
+{
+	static u64 cxl_occ_ctr = 0, tot_occ_ctr = 0;
+	static u64 cxl_ins_ctr = 0, tot_ins_ctr = 0;
+	u64 dr_occ, cxl_occ, dr_ins, cxl_ins, tot_occ, tot_ins;
+	u64 dram_latency, cxl_latency, val;
+	static bool last_output = false;
+	static struct timespec64 last_time;
+	struct timespec64 now_time;
+	static unsigned long last_si = 0;
+
+	if (!cxl_occ_ctr && !tot_occ_ctr &&
+				!cxl_ins_ctr && !tot_ins_ctr){
+		tot_occ_ctr = read_cha_msr(MSR_CHA_CTR_BASE);
+		cxl_occ_ctr = read_cha_msr(MSR_CHA_CTR_BASE + 16);
+		tot_ins_ctr = read_cha_msr(MSR_CHA_CTR_BASE + 32);
+		cxl_ins_ctr = read_cha_msr(MSR_CHA_CTR_BASE + 48);
+		printk(KERN_INFO "COLLOID: INIT:[%llu,%llu,%llu,%llu]\n",
+					tot_occ_ctr, cxl_occ_ctr, tot_ins_ctr, cxl_ins_ctr);
+		last_output = false;
+		return false;
+	}
+
+	if (si == last_si)
+		return last_output;
+	else
+		last_si = si;
+
+	val = read_cha_msr(MSR_CHA_CTR_BASE);
+	tot_occ = val - tot_occ_ctr;
+	tot_occ_ctr = val;
+
+	val = read_cha_msr(MSR_CHA_CTR_BASE + 16);
+	cxl_occ = val - cxl_occ_ctr;
+	cxl_occ_ctr = val;
+
+	if (tot_occ > cxl_occ)
+		dr_occ = tot_occ - cxl_occ;
+	else
+		dr_occ = 0;
+
+	val = read_cha_msr(MSR_CHA_CTR_BASE + 32);
+	tot_ins = val - tot_ins_ctr;
+	tot_ins_ctr = val;
+
+	val = read_cha_msr(MSR_CHA_CTR_BASE + 48);
+	cxl_ins = val - cxl_ins_ctr;
+	cxl_ins_ctr = val;
+
+	if (tot_ins > cxl_ins)
+		dr_ins = tot_ins - cxl_ins;
+	else
+		dr_ins = 0;
+
+	dram_latency = dr_occ / (dr_ins + 1);
+	cxl_latency = cxl_occ / (cxl_ins + 1);
+	memcpy(&last_time, &now_time, sizeof(struct timespec64));
+
+	printk(KERN_INFO
+			"COLLOID: OCC:[%llu,%llu,%llu], INS:[%llu,%llu,%llu], LAT:[%llu,%llu]\n",
+			tot_occ, cxl_occ, dr_occ, tot_ins, cxl_ins, dr_ins,
+			dram_latency, cxl_latency);
+
+	if (dram_latency > cxl_latency)
+		last_output = true;
+	else
+		last_output = false;
+
+	return last_output;
+}
+
 static void damos_apply_scheme(struct damon_ctx *c, struct damon_target *t,
 		struct damon_region *r, struct damos *s)
 {
@@ -1435,6 +1564,11 @@ static void damon_do_apply_schemes(struct damon_ctx *c,
 
 		if (!damos_valid_target(c, t, r, s))
 			continue;
+
+		if (s->action == DAMOS_COLLOID_BASIC) {
+			if (!latency_dram_gt_cxl(c->passed_sample_intervals))
+				continue;
+		}
 
 		damos_apply_scheme(c, t, r, s);
 	}
@@ -1948,6 +2082,43 @@ static int kdamond_wait_activation(struct damon_ctx *ctx)
 	return -EBUSY;
 }
 
+static void kdamond_init_schemes(struct damon_ctx *ctx)
+{
+	int ret = 0;
+	u64 msrnum, msrval;
+
+	msrnum = MSR_CHA_CTL_BASE;
+	msrval = 0x00C8168600000136UL; /* OCCUPANCY_TOTAL */
+	ret = wrmsr_on_cpu(COLLOID_MON_CORE, msrnum,
+				msrval & 0xFFFFFFFF, msrval >> 32);
+	if (ret)
+		goto err;
+
+	msrnum = MSR_CHA_CTL_BASE + 16;
+	msrval = 0x10C8168200000136UL; /* OCCUPANCY_CXL */
+	ret = wrmsr_on_cpu(COLLOID_MON_CORE, msrnum,
+				msrval & 0xFFFFFFFF, msrval >> 32);
+	if (ret)
+		goto err;
+
+	msrnum = MSR_CHA_CTL_BASE + 32;
+	msrval = 0x00C8168600000135UL; /* INSERTS_TOTAL */
+	ret = wrmsr_on_cpu(COLLOID_MON_CORE, msrnum,
+				msrval & 0xFFFFFFFF, msrval >> 32);
+	if (ret)
+		goto err;
+
+	msrnum = MSR_CHA_CTL_BASE + 48;
+	msrval = 0x10C8168200000135UL; /* INSERTS_CXL */
+	ret = wrmsr_on_cpu(COLLOID_MON_CORE, msrnum,
+				msrval & 0xFFFFFFFF, msrval >> 32);
+	if (ret)
+		goto err;
+	return;
+err:
+	printk(KERN_ERR "wrmsr %llu returned %d\n", msrnum, ret);
+}
+
 static void kdamond_init_intervals_sis(struct damon_ctx *ctx)
 {
 	unsigned long sample_interval = ctx->attrs.sample_interval ?
@@ -1982,6 +2153,7 @@ static int kdamond_fn(void *data)
 
 	complete(&ctx->kdamond_started);
 	kdamond_init_intervals_sis(ctx);
+	kdamond_init_schemes(ctx);
 
 	if (ctx->ops.init)
 		ctx->ops.init(ctx);
@@ -2022,6 +2194,8 @@ static int kdamond_fn(void *data)
 			max_nr_accesses = ctx->ops.check_accesses(ctx);
 
 		if (ctx->passed_sample_intervals >= next_aggregation_sis) {
+			if (ctx->ops.pre_aggregation)
+				max_nr_accesses = ctx->ops.pre_aggregation(ctx);
 			kdamond_merge_regions(ctx,
 					max_nr_accesses / 10,
 					sz_limit);

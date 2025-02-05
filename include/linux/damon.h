@@ -13,11 +13,25 @@
 #include <linux/time64.h>
 #include <linux/types.h>
 #include <linux/random.h>
+#include <linux/perf_event.h>
 
 /* Minimal region size.  Every damon_region is aligned by this. */
 #define DAMON_MIN_REGION	PAGE_SIZE
 /* Max priority score for DAMON-based operation schemes */
 #define DAMOS_MAX_SCORE		(99)
+
+/* CHA MSR Constants */
+#define COLLOID_MON_CORE 95
+#define NR_CHA_BOXES 56
+#define NR_CHA_CNTRS 4
+#define NR_IDX_CHA 4
+#define CTRS_PER_CHA 4
+#define MSR_CHA_SZ 16
+#define MSR_CHA_BASE 0x2000L
+#define MSR_CHA_CTL_BASE 0x2002L
+#define MSR_CHA_FILTER_BASE 0x200EL
+#define MSR_CHA_STATUS_BASE 0x2001L
+#define MSR_CHA_CTR_BASE 0x2008L
 
 /* Get a random number in [l, r) */
 static inline unsigned long damon_rand(unsigned long l, unsigned long r)
@@ -73,6 +87,8 @@ struct damon_region {
 	unsigned int age;
 /* private: Internal value for age calculation. */
 	unsigned int last_nr_accesses;
+	unsigned int nr_pebs_samples;
+	unsigned long pebs_sample_period_sum;
 };
 
 /**
@@ -107,6 +123,7 @@ struct damon_target {
  * @DAMOS_LRU_DEPRIO:	Deprioritize the region on its LRU lists.
  * @DAMOS_MIGRATE_HOT:  Migrate the regions prioritizing warmer regions.
  * @DAMOS_MIGRATE_COLD:	Migrate the regions prioritizing colder regions.
+ * @DAMOS_COLLOID_BASIC:	Migrate Hot to CXL when DRAM latency > CXL latency.
  * @DAMOS_STAT:		Do nothing but count the stat.
  * @NR_DAMOS_ACTIONS:	Total number of DAMOS actions
  *
@@ -127,6 +144,7 @@ enum damos_action {
 	DAMOS_MIGRATE_HOT,
 	DAMOS_MIGRATE_COLD,
 	DAMOS_STAT,		/* Do nothing but only record the stat */
+	DAMOS_COLLOID_BASIC,
 	NR_DAMOS_ACTIONS,
 };
 
@@ -498,6 +516,7 @@ struct damon_operations {
 	void (*update)(struct damon_ctx *context);
 	void (*prepare_access_checks)(struct damon_ctx *context);
 	unsigned int (*check_accesses)(struct damon_ctx *context);
+	unsigned int (*pre_aggregation)(struct damon_ctx *context);
 	void (*reset_aggregated)(struct damon_ctx *context);
 	int (*get_scheme_score)(struct damon_ctx *context,
 			struct damon_target *t, struct damon_region *r,
@@ -581,6 +600,49 @@ struct damon_attrs {
 	unsigned long max_nr_regions;
 };
 
+#define ALL_STORES_EVENT 0x82d0
+#define LLC_MISS_LOADS_EVENT  0x20d1
+#define NR_DAMON_PEBS_EVENTS 2
+
+#define PEBS_EVENT_PAGES 128
+#define MAX_PEBS_CPUS 96
+#define PEBS_FREQ 1000
+
+#define PEBS_SAMPLE_TYPE (0UL | \
+			PERF_SAMPLE_IP | \
+			PERF_SAMPLE_TID | \
+			PERF_SAMPLE_TIME | \
+			PERF_SAMPLE_ADDR | \
+			PERF_SAMPLE_CPU | \
+			PERF_SAMPLE_PERIOD | \
+			PERF_SAMPLE_PHYS_ADDR)
+
+struct damon_pebs_sample {
+	struct perf_event_header header; // 8 bytes
+	uint64_t ip;
+	uint32_t pid, tid;
+	uint64_t timestamp;
+	uint64_t address;
+	uint32_t cpu, res;
+	uint64_t period;
+	uint64_t phys_addr;
+};
+
+struct damon_pebs_attrs {
+	uint64_t sample_freq;
+};
+
+struct damon_pebs_ctx {
+	struct perf_event **pebs_events;
+	struct damon_pebs_attrs pebs_attrs;
+};
+
+int damon_get_pebs_freq(void);
+int damon_set_pebs_freq(int freq);
+void damon_get_pebs_cpus(struct cpumask *mask);
+void damon_set_pebs_cpus(struct cpumask *mask);
+void damon_setall_pebs_cpus(void);
+
 /**
  * struct damon_ctx - Represents a context for each monitoring.  This is the
  * main interface that allows users to set the attributes and get the results
@@ -641,6 +703,7 @@ struct damon_ctx {
 
 	struct list_head adaptive_targets;
 	struct list_head schemes;
+	struct damon_pebs_ctx pebs_ctx;
 };
 
 static inline struct damon_region *damon_next_region(struct damon_region *r)
@@ -781,6 +844,10 @@ int damon_stop(struct damon_ctx **ctxs, int nr_ctxs);
 
 int damon_set_region_biggest_system_ram_default(struct damon_target *t,
 				unsigned long *start, unsigned long *end);
+int damon_va_three_regions(struct damon_target *t,
+			struct damon_addr_range regions[3]);
+unsigned long damon_pa_migrate_pages(struct list_head *folio_list,
+			int target_nid);
 
 #endif	/* CONFIG_DAMON */
 
