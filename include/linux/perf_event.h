@@ -1992,4 +1992,16 @@ static inline void perf_lopwr_cb(bool mode)
 }
 #endif
 
+int perf_event_init_from_kernel(struct perf_event **event,
+			uint64_t sample_type, uint64_t config, uint64_t cpu,
+			uint32_t nr_pages, uint64_t freq);
+int perf_counter_init_from_kernel(struct perf_event **event,
+			uint64_t config, uint64_t cpu);
+uint64_t perf_counter_read_from_kernel(struct perf_event *event,
+			uint64_t *enabled, uint64_t *running);
+int perf_setup_event_for_reading(struct perf_event *event);
+void* perf_get_event_sample(int *ret);
+void perf_put_event_sample(void);
+void perf_free_event_reader(void);
+
 #endif /* _LINUX_PERF_EVENT_H */
