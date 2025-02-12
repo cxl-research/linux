@@ -610,6 +610,7 @@ static unsigned long damon_va_apply_scheme(struct damon_ctx *ctx,
 		break;
 	case DAMOS_STAT:
 		return 0;
+	case DAMOS_MIGRATE_HOT:
 	case DAMOS_COLLOID_BASIC:
 		return damon_va_migrate(t, r, scheme);
 	default:
@@ -630,6 +631,7 @@ static int damon_va_scheme_score(struct damon_ctx *context,
 	switch (scheme->action) {
 	case DAMOS_PAGEOUT:
 		return damon_cold_score(context, r, scheme);
+	case DAMOS_MIGRATE_HOT:
 	case DAMOS_COLLOID_BASIC:
 		return damon_hot_score(context, r, scheme);
 	default:
