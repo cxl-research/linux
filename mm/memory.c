@@ -5613,8 +5613,12 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 
 	target_nid = numa_migrate_check(folio, vmf, vmf->address, &flags,
 					writable, &last_cpupid);
-	if (target_nid == NUMA_NO_NODE)
-		goto out_map;
+	if (target_nid == NUMA_NO_NODE) {
+		/* If it is on a congested node, migrate to CXL */
+		target_nid = numa_migrate_from_congested(folio, nid);
+		if (target_nid == NUMA_NO_NODE)
+			goto out_map;
+	}
 	if (migrate_misplaced_folio_prepare(folio, vma, target_nid)) {
 		flags |= TNF_MIGRATE_FAIL;
 		goto out_map;

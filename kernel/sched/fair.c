@@ -37,6 +37,7 @@
 #include <linux/sched/cputime.h>
 #include <linux/sched/isolation.h>
 #include <linux/sched/nohz.h>
+#include <linux/swap.h>
 
 #include <linux/cpuidle.h>
 #include <linux/interrupt.h>
@@ -1900,6 +1901,30 @@ static void numa_promotion_adjust_threshold(struct pglist_data *pgdat,
 		pgdat->nbp_th_nr_cand = nr_cand;
 		pgdat->nbp_threshold = th;
 	}
+}
+
+int numa_migrate_from_congested(struct folio *folio, int src_nid)
+{
+	struct pglist_data *pgdat = NODE_DATA(src_nid);
+	unsigned int latency, th;
+
+	if (src_nid != NID_CONGESTED)
+		return NUMA_NO_NODE;
+
+	/* Use Hint-Fault Latency if possible, else use Active/Inactive */
+	if (folio_use_access_time(folio)) {
+		latency = numa_hint_fault_latency(folio);
+		th = pgdat->nbp_threshold ? : sysctl_numa_balancing_hot_threshold;
+		if (latency >= th)
+			return NUMA_NO_NODE;
+	} else {
+		if (!folio_test_active(folio)) {
+			folio_mark_accessed(folio);
+			return NUMA_NO_NODE;
+		}
+	}
+
+	return next_demotion_node(src_nid);
 }
 
 bool should_numa_migrate_memory(struct task_struct *p, struct folio *folio,
