@@ -1346,6 +1346,7 @@ const char * const vmstat_text[] = {
 	"thp_migration_success",
 	"thp_migration_fail",
 	"thp_migration_split",
+	"pgdemote_congested",
 #endif
 #ifdef CONFIG_COMPACTION
 	"compact_migrate_scanned",

@@ -1924,6 +1924,7 @@ int numa_migrate_from_congested(struct folio *folio, int src_nid)
 		}
 	}
 
+	count_vm_event(PGDEMOTE_CONGESTED);
 	return next_demotion_node(src_nid);
 }
 
