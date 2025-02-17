@@ -1910,15 +1910,18 @@ int numa_migrate_from_congested(struct folio *folio, int src_nid)
 
 	if (src_nid != NID_CONGESTED)
 		return NUMA_NO_NODE;
+	count_vm_event(PGDEMOTE_ATTEMPTED);
 
 	/* Use Hint-Fault Latency if possible, else use Active/Inactive */
 	if (folio_use_access_time(folio)) {
+		count_vm_event(PGDEMOTE_USE_LATENCY);
 		latency = numa_hint_fault_latency(folio);
 		th = pgdat->nbp_threshold ? : sysctl_numa_balancing_hot_threshold;
 		if (latency >= th)
 			return NUMA_NO_NODE;
 	} else {
 		if (!folio_test_active(folio)) {
+			count_vm_event(PGDEMOTE_MADE_ACTIVE);
 			folio_mark_accessed(folio);
 			return NUMA_NO_NODE;
 		}
