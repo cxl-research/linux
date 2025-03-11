@@ -2896,7 +2896,10 @@ static inline bool pagetable_is_reserved(struct ptdesc *pt)
  */
 static inline struct ptdesc *pagetable_alloc_noprof(gfp_t gfp, unsigned int order)
 {
-	struct page *page = alloc_pages_noprof(gfp | __GFP_COMP, order);
+	// struct page *page = alloc_pages_noprof(gfp | __GFP_COMP, order);
+
+	/* Force all pagetables to the Local DRAM node */
+	struct page *page = alloc_pages_node_noprof(numa_node_id(), gfp | __GFP_COMP, order);
 
 	return page_ptdesc(page);
 }
