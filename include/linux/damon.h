@@ -153,6 +153,7 @@ enum damos_action {
  *
  * @DAMOS_QUOTA_USER_INPUT:	User-input value.
  * @DAMOS_QUOTA_SOME_MEM_PSI_US:	System level some memory PSI in us.
+ * @DAMOS_QUOTA_TIER_LATENCIES: Latency metric.
  * @NR_DAMOS_QUOTA_GOAL_METRICS:	Number of DAMOS quota goal metrics.
  *
  * Metrics equal to larger than @NR_DAMOS_QUOTA_GOAL_METRICS are unsupported.
@@ -160,6 +161,7 @@ enum damos_action {
 enum damos_quota_goal_metric {
 	DAMOS_QUOTA_USER_INPUT,
 	DAMOS_QUOTA_SOME_MEM_PSI_US,
+	DAMOS_QUOTA_TIER_LATENCIES,
 	NR_DAMOS_QUOTA_GOAL_METRICS,
 };
 
@@ -305,6 +307,9 @@ struct damos_watermarks {
  * @nr_applied:	Total number of regions that the scheme is applied.
  * @sz_applied:	Total size of regions that the scheme is applied.
  * @qt_exceeds: Total number of times the quota of the scheme has exceeded.
+ * @dram_latency: DRAM Latency (for colloid_scaled).
+ * @cxl_latency: CXL Latency (for colloid_scaled).
+ * @quota_score: Score of the quota tuning goal.
  */
 struct damos_stat {
 	unsigned long nr_tried;
@@ -312,6 +317,9 @@ struct damos_stat {
 	unsigned long nr_applied;
 	unsigned long sz_applied;
 	unsigned long qt_exceeds;
+	unsigned long dram_latency;
+	unsigned long cxl_latency;
+	unsigned long quota_score;
 };
 
 /**

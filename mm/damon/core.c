@@ -1644,9 +1644,74 @@ static inline u64 damos_get_some_mem_psi_total(void)
 
 #endif	/* CONFIG_PSI */
 
-static void damos_set_quota_goal_current_value(struct damos_quota_goal *goal)
+static void read_tier_latencies(u64 *dramltc, u64 *cxlltc)
+{
+	static u64 cxl_occ_ctr = 0, tot_occ_ctr = 0;
+	static u64 cxl_ins_ctr = 0, tot_ins_ctr = 0;
+	u64 dr_occ, cxl_occ, dr_ins, cxl_ins, tot_occ, tot_ins, val;
+
+	if (!cxl_occ_ctr && !tot_occ_ctr &&
+				!cxl_ins_ctr && !tot_ins_ctr){
+		tot_occ_ctr = read_cha_msr(MSR_CHA_CTR_BASE);
+		cxl_occ_ctr = read_cha_msr(MSR_CHA_CTR_BASE + 16);
+		tot_ins_ctr = read_cha_msr(MSR_CHA_CTR_BASE + 32);
+		cxl_ins_ctr = read_cha_msr(MSR_CHA_CTR_BASE + 48);
+		printk(KERN_INFO "tier_latencies: INIT:[%llu,%llu,%llu,%llu]\n",
+					tot_occ_ctr, cxl_occ_ctr, tot_ins_ctr, cxl_ins_ctr);
+		return;
+	}
+
+	val = read_cha_msr(MSR_CHA_CTR_BASE);
+	tot_occ = val - tot_occ_ctr;
+	tot_occ_ctr = val;
+
+	val = read_cha_msr(MSR_CHA_CTR_BASE + 16);
+	cxl_occ = val - cxl_occ_ctr;
+	cxl_occ_ctr = val;
+
+	if (tot_occ > cxl_occ)
+		dr_occ = tot_occ - cxl_occ;
+	else
+		dr_occ = 0;
+
+	val = read_cha_msr(MSR_CHA_CTR_BASE + 32);
+	tot_ins = val - tot_ins_ctr;
+	tot_ins_ctr = val;
+
+	val = read_cha_msr(MSR_CHA_CTR_BASE + 48);
+	cxl_ins = val - cxl_ins_ctr;
+	cxl_ins_ctr = val;
+
+	if (tot_ins > cxl_ins)
+		dr_ins = tot_ins - cxl_ins;
+	else
+		dr_ins = 0;
+
+	*dramltc = dr_occ / (dr_ins + 1);
+	*cxlltc = cxl_occ / (cxl_ins + 1);
+}
+
+static unsigned long latency_score_bp(u64 dramlat, u64 cxllat)
+{
+	unsigned long score = 0;
+	unsigned long window = ((cxllat / 4) + 1);
+
+	if ((cxllat == 0) || (dramlat > cxllat + window))
+		score = 2000;
+	else if ((dramlat == 0) || (dramlat < cxllat - window))
+		score = 18000;
+	else {
+		score = 2000 + (16000 * ((dramlat + window - cxllat) / (2 * window)));
+	}
+
+	return score;
+}
+
+static void damos_set_quota_goal_current_value(struct damos_quota_goal *goal,
+			struct damos_stat *stat)
 {
 	u64 now_psi_total;
+	u64 dramlat, cxllat;
 
 	switch (goal->metric) {
 	case DAMOS_QUOTA_USER_INPUT:
@@ -1657,19 +1722,27 @@ static void damos_set_quota_goal_current_value(struct damos_quota_goal *goal)
 		goal->current_value = now_psi_total - goal->last_psi_total;
 		goal->last_psi_total = now_psi_total;
 		break;
+	case DAMOS_QUOTA_TIER_LATENCIES:
+		read_tier_latencies(&dramlat, &cxllat);
+		stat->dram_latency = dramlat;
+		stat->cxl_latency = cxllat;
+		goal->target_value = 10000;
+		goal->current_value = latency_score_bp(dramlat, cxllat);
+		break;
 	default:
 		break;
 	}
 }
 
 /* Return the highest score since it makes schemes least aggressive */
-static unsigned long damos_quota_score(struct damos_quota *quota)
+static unsigned long damos_quota_score(struct damos_quota *quota,
+			struct damos_stat *stat)
 {
 	struct damos_quota_goal *goal;
 	unsigned long highest_score = 0;
 
 	damos_for_each_quota_goal(goal, quota) {
-		damos_set_quota_goal_current_value(goal);
+		damos_set_quota_goal_current_value(goal, stat);
 		highest_score = max(highest_score,
 				goal->current_value * 10000 /
 				goal->target_value);
@@ -1681,10 +1754,12 @@ static unsigned long damos_quota_score(struct damos_quota *quota)
 /*
  * Called only if quota->ms, or quota->sz are set, or quota->goals is not empty
  */
-static void damos_set_effective_quota(struct damos_quota *quota)
+static void damos_set_effective_quota(struct damos_quota *quota,
+			struct damos_stat *stat)
 {
 	unsigned long throughput;
-	unsigned long esz;
+	unsigned long esz, minesz = (quota->sz / 1024);
+;
 
 	if (!quota->ms && list_empty(&quota->goals)) {
 		quota->esz = quota->sz;
@@ -1692,11 +1767,11 @@ static void damos_set_effective_quota(struct damos_quota *quota)
 	}
 
 	if (!list_empty(&quota->goals)) {
-		unsigned long score = damos_quota_score(quota);
+		unsigned long score = damos_quota_score(quota, stat);
+		stat->quota_score = score;
 
 		quota->esz_bp = damon_feed_loop_next_input(
-				max(quota->esz_bp, 10000UL),
-				score);
+				max(quota->esz_bp, 10000 * minesz), score);
 		esz = quota->esz_bp / 10000;
 	}
 
@@ -1737,7 +1812,7 @@ static void damos_adjust_quota(struct damon_ctx *c, struct damos *s)
 		quota->total_charged_sz += quota->charged_sz;
 		quota->charged_from = jiffies;
 		quota->charged_sz = 0;
-		damos_set_effective_quota(quota);
+		damos_set_effective_quota(quota, &s->stat);
 	}
 
 	if (!c->ops.get_scheme_score)

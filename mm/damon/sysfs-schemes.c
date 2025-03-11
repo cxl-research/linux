@@ -234,6 +234,9 @@ struct damon_sysfs_stats {
 	unsigned long nr_applied;
 	unsigned long sz_applied;
 	unsigned long qt_exceeds;
+	unsigned long dram_latency;
+	unsigned long cxl_latency;
+	unsigned long quota_score;
 };
 
 static struct damon_sysfs_stats *damon_sysfs_stats_alloc(void)
@@ -286,6 +289,33 @@ static ssize_t qt_exceeds_show(struct kobject *kobj,
 	return sysfs_emit(buf, "%lu\n", stats->qt_exceeds);
 }
 
+static ssize_t dram_latency_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct damon_sysfs_stats *stats = container_of(kobj,
+			struct damon_sysfs_stats, kobj);
+
+	return sysfs_emit(buf, "%lu\n", stats->dram_latency);
+}
+
+static ssize_t cxl_latency_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct damon_sysfs_stats *stats = container_of(kobj,
+			struct damon_sysfs_stats, kobj);
+
+	return sysfs_emit(buf, "%lu\n", stats->cxl_latency);
+}
+
+static ssize_t quota_score_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct damon_sysfs_stats *stats = container_of(kobj,
+			struct damon_sysfs_stats, kobj);
+
+	return sysfs_emit(buf, "%lu\n", stats->quota_score);
+}
+
 static void damon_sysfs_stats_release(struct kobject *kobj)
 {
 	kfree(container_of(kobj, struct damon_sysfs_stats, kobj));
@@ -306,12 +336,24 @@ static struct kobj_attribute damon_sysfs_stats_sz_applied_attr =
 static struct kobj_attribute damon_sysfs_stats_qt_exceeds_attr =
 		__ATTR_RO_MODE(qt_exceeds, 0400);
 
+static struct kobj_attribute damon_sysfs_stats_dram_latency_attr =
+		__ATTR_RO_MODE(dram_latency, 0400);
+
+static struct kobj_attribute damon_sysfs_stats_cxl_latency_attr =
+		__ATTR_RO_MODE(cxl_latency, 0400);
+
+static struct kobj_attribute damon_sysfs_stats_quota_score_attr =
+		__ATTR_RO_MODE(quota_score, 0400);
+
 static struct attribute *damon_sysfs_stats_attrs[] = {
 	&damon_sysfs_stats_nr_tried_attr.attr,
 	&damon_sysfs_stats_sz_tried_attr.attr,
 	&damon_sysfs_stats_nr_applied_attr.attr,
 	&damon_sysfs_stats_sz_applied_attr.attr,
 	&damon_sysfs_stats_qt_exceeds_attr.attr,
+	&damon_sysfs_stats_dram_latency_attr.attr,
+	&damon_sysfs_stats_cxl_latency_attr.attr,
+	&damon_sysfs_stats_quota_score_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(damon_sysfs_stats);
@@ -837,6 +879,7 @@ struct damos_sysfs_quota_goal {
 static const char * const damos_sysfs_quota_goal_metric_strs[] = {
 	"user_input",
 	"some_mem_psi_us",
+	"tier_latencies",
 };
 
 static struct damos_sysfs_quota_goal *damos_sysfs_quota_goal_alloc(void)
@@ -2124,6 +2167,9 @@ void damon_sysfs_schemes_update_stats(
 		sysfs_stats->nr_applied = scheme->stat.nr_applied;
 		sysfs_stats->sz_applied = scheme->stat.sz_applied;
 		sysfs_stats->qt_exceeds = scheme->stat.qt_exceeds;
+		sysfs_stats->dram_latency = scheme->stat.dram_latency;
+		sysfs_stats->cxl_latency = scheme->stat.cxl_latency;
+		sysfs_stats->quota_score = scheme->stat.quota_score;
 	}
 }
 
