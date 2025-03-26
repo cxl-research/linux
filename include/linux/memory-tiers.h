@@ -7,6 +7,7 @@
 #include <linux/kref.h>
 #include <linux/mmzone.h>
 #include <linux/notifier.h>
+#include <linux/device.h>
 /*
  * Each tier cover a abstrace distance chunk size of 128
  */

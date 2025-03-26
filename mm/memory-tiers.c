@@ -289,6 +289,7 @@ out:
 	rcu_read_unlock();
 	return toptier;
 }
+EXPORT_SYMBOL_GPL(node_is_toptier);
 
 void node_get_allowed_targets(pg_data_t *pgdat, nodemask_t *targets)
 {
@@ -352,6 +353,7 @@ int next_demotion_node(int node)
 
 	return target;
 }
+EXPORT_SYMBOL_GPL(next_demotion_node);
 
 static void disable_all_demotion_targets(void)
 {
@@ -531,6 +533,8 @@ static struct memory_tier *set_node_memory_tier(int node)
 	}
 
 	__init_node_memory_type(node, memtype);
+	pr_info("set_node_memory_tier: nid %d, adist %d, mt.adist %d\n",
+			node, adist, memtype->adistance);
 
 	memtype = node_memory_types[node].memtype;
 	node_set(node, memtype->nodes);
