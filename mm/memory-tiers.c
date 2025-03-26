@@ -10,22 +10,6 @@
 
 #include "internal.h"
 
-struct memory_tier {
-	/* hierarchy of memory tiers */
-	struct list_head list;
-	/* list of all memory types part of this tier */
-	struct list_head memory_types;
-	/*
-	 * start value of abstract distance. memory tier maps
-	 * an abstract distance  range,
-	 * adistance_start .. adistance_start + MEMTIER_CHUNK_SIZE
-	 */
-	int adistance_start;
-	struct device dev;
-	/* All the nodes that are part of all the lower memory tiers. */
-	nodemask_t lower_tier_mask;
-};
-
 struct demotion_nodes {
 	nodemask_t preferred;
 };
@@ -44,6 +28,7 @@ static LIST_HEAD(memory_tiers);
 static LIST_HEAD(default_memory_types);
 static struct node_memory_type_map node_memory_types[MAX_NUMNODES];
 struct memory_dev_type *default_dram_type;
+struct memory_dev_type *default_cxl_type;
 nodemask_t default_dram_nodes __initdata = NODE_MASK_NONE;
 
 static const struct bus_type memory_tier_subsys = {
@@ -130,6 +115,11 @@ static int top_tier_adistance;
  */
 static struct demotion_nodes *node_demotion __read_mostly;
 #endif /* CONFIG_MIGRATION */
+
+int colloid_local_lat_gt_remote = 0;
+EXPORT_SYMBOL(colloid_local_lat_gt_remote);
+int colloid_nid_of_interest = NUMA_NO_NODE;
+EXPORT_SYMBOL(colloid_nid_of_interest);
 
 static BLOCKING_NOTIFIER_HEAD(mt_adistance_algorithms);
 
@@ -257,7 +247,7 @@ link_memtype:
 	return memtier;
 }
 
-static struct memory_tier *__node_get_memory_tier(int node)
+struct memory_tier *__node_get_memory_tier(int node)
 {
 	pg_data_t *pgdat;
 
@@ -272,6 +262,7 @@ static struct memory_tier *__node_get_memory_tier(int node)
 	return rcu_dereference_check(pgdat->memtier,
 				     lockdep_is_held(&memory_tier_lock));
 }
+EXPORT_SYMBOL_GPL(__node_get_memory_tier);
 
 #ifdef CONFIG_MIGRATION
 bool node_is_toptier(int node)
@@ -466,26 +457,14 @@ static void establish_demotion_targets(void)
 		} while (1);
 	}
 	/*
-	 * Promotion is allowed from a memory tier to higher
-	 * memory tier only if the memory tier doesn't include
-	 * compute. We want to skip promotion from a memory tier,
-	 * if any node that is part of the memory tier have CPUs.
-	 * Once we detect such a memory tier, we consider that tier
-	 * as top tiper from which promotion is not allowed.
+	 * Since we need to allow promotion from nodes with CPUs for expts,
+	 * we have to ensure that nodes with CPUs (remote Colloid) can be 
+	 * made not-toptier. This is done by setting the tier to an abstract
+	 * distance greater than that of default DRAM.
 	 */
-	list_for_each_entry_reverse(memtier, &memory_tiers, list) {
-		tier_nodes = get_memtier_nodemask(memtier);
-		nodes_and(tier_nodes, node_states[N_CPU], tier_nodes);
-		if (!nodes_empty(tier_nodes)) {
-			/*
-			 * abstract distance below the max value of this memtier
-			 * is considered toptier.
-			 */
-			top_tier_adistance = memtier->adistance_start +
-						MEMTIER_CHUNK_SIZE - 1;
-			break;
-		}
-	}
+	top_tier_adistance = round_down(default_dram_type->adistance, 
+				MEMTIER_CHUNK_SIZE) + MEMTIER_CHUNK_SIZE - 1;
+
 	/*
 	 * Now build the lower_tier mask for each node collecting node mask from
 	 * all memory tier below it. This allows us to fallback demotion page
@@ -533,7 +512,7 @@ static struct memory_tier *set_node_memory_tier(int node)
 {
 	struct memory_tier *memtier;
 	struct memory_dev_type *memtype = default_dram_type;
-	int adist = MEMTIER_ADISTANCE_DRAM;
+	int adist = node < 2 ? MEMTIER_ADISTANCE_DRAM : MEMTIER_ADISTANCE_CXL;
 	pg_data_t *pgdat = NODE_DATA(node);
 
 
@@ -546,7 +525,7 @@ static struct memory_tier *set_node_memory_tier(int node)
 	if (!node_memory_types[node].memtype) {
 		memtype = mt_find_alloc_memory_type(adist, &default_memory_types);
 		if (IS_ERR(memtype)) {
-			memtype = default_dram_type;
+			memtype = node < 2 ? default_dram_type : default_cxl_type;
 			pr_info("Failed to allocate a memory type. Fall back.\n");
 		}
 	}
@@ -900,6 +879,46 @@ static int __meminit memtier_hotplug_callback(struct notifier_block *self,
 	return notifier_from_errno(0);
 }
 
+struct memory_dev_type *colloid_get_default_dram_memtype() {
+	return default_dram_type;
+}
+EXPORT_SYMBOL_GPL(colloid_get_default_dram_memtype);
+
+struct memory_dev_type *colloid_get_default_cxl_memtype() {
+	return default_cxl_type;
+}
+EXPORT_SYMBOL_GPL(colloid_get_default_cxl_memtype);
+
+void colloid_init_memory_tier(int node) {
+	struct memory_tier *memtier;
+
+	if (node_state(node, N_CPU)) {
+		pr_info("colloid: NUMA node is NOT zero CPU");
+	} else {
+		pr_info("colloid: NUMA node is zero CPU");
+	}
+
+	mutex_lock(&memory_tier_lock);
+	memtier = set_node_memory_tier(node);
+	if (!IS_ERR(memtier)) {
+		pr_info("set_node_memory_tier success");
+		establish_demotion_targets();
+		pr_info("established demotion targets");
+	}
+	mutex_unlock(&memory_tier_lock);
+}
+EXPORT_SYMBOL_GPL(colloid_init_memory_tier);
+
+void colloid_clear_memory_tier(int node) {
+	mutex_lock(&memory_tier_lock);
+	clear_node_memory_tier(node);
+	pr_info("clear_node_memory_tier");
+	establish_demotion_targets();
+	pr_info("established demotion targets");
+	mutex_unlock(&memory_tier_lock);
+}
+EXPORT_SYMBOL_GPL(colloid_clear_memory_tier);
+
 static int __init memory_tier_init(void)
 {
 	int ret;
@@ -921,6 +940,8 @@ static int __init memory_tier_init(void)
 	 */
 	default_dram_type = mt_find_alloc_memory_type(MEMTIER_ADISTANCE_DRAM,
 						      &default_memory_types);
+	default_cxl_type = mt_find_alloc_memory_type(MEMTIER_ADISTANCE_CXL,
+									&default_memory_types);
 	mutex_unlock(&memory_tier_lock);
 	if (IS_ERR(default_dram_type))
 		panic("%s() failed to allocate default DRAM tier\n", __func__);
