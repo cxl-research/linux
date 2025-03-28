@@ -55,6 +55,8 @@
 #include "stats.h"
 #include "autogroup.h"
 
+extern int colloid_local_lat_gt_remote;
+extern int colloid_nid_of_interest;
 /*
  * The initial- and re-scaling of tunables is configurable
  *
@@ -1902,6 +1904,21 @@ static void numa_promotion_adjust_threshold(struct pglist_data *pgdat,
 	}
 }
 
+static bool can_migrate_colloid(int src_nid, int dst_nid)
+{
+	if (READ_ONCE(colloid_local_lat_gt_remote)) {
+		/* check for potential DRAM->CXL migration */
+		if (src_nid == READ_ONCE(colloid_nid_of_interest))
+			return true;
+	} else {
+		/* check for potential CXL->DRAM migration */
+		if (dst_nid == READ_ONCE(colloid_nid_of_interest) &&
+				!node_is_toptier(src_nid))
+			return true;
+	}
+	return false;
+}
+
 bool should_numa_migrate_memory(struct task_struct *p, struct folio *folio,
 				int src_nid, int dst_cpu)
 {
@@ -1915,22 +1932,12 @@ bool should_numa_migrate_memory(struct task_struct *p, struct folio *folio,
 	if (!node_state(dst_nid, N_MEMORY))
 		return false;
 
-	/*
-	 * The pages in slow memory node should be migrated according
-	 * to hot/cold instead of private/shared.
-	 */
 	if (folio_use_access_time(folio)) {
 		struct pglist_data *pgdat;
 		unsigned long rate_limit;
 		unsigned int latency, th, def_th;
 
 		pgdat = NODE_DATA(dst_nid);
-		if (pgdat_free_space_enough(pgdat)) {
-			/* workload changed, reset hot threshold */
-			pgdat->nbp_threshold = 0;
-			return true;
-		}
-
 		def_th = sysctl_numa_balancing_hot_threshold;
 		rate_limit = sysctl_numa_balancing_promote_rate_limit << \
 			(20 - PAGE_SHIFT);
@@ -1941,15 +1948,25 @@ bool should_numa_migrate_memory(struct task_struct *p, struct folio *folio,
 		if (latency >= th)
 			return false;
 
+		if (sysctl_numa_balancing_mode & NUMA_BALANCING_COLLOID)
+			return can_migrate_colloid(src_nid, dst_nid);
+
 		return !numa_promotion_rate_limit(pgdat, rate_limit,
-						  folio_nr_pages(folio));
+								folio_nr_pages(folio));
 	}
+
+	/* The code below was originally intended for Normal NUMA
+	 * Balancing. We may now reach here even if it is OFF, since
+	 * we enable local hint-faults. We explicitly check that.
+	 */
+	if(!(sysctl_numa_balancing_mode & NUMA_BALANCING_NORMAL))
+		return false;
 
 	this_cpupid = cpu_pid_to_cpupid(dst_cpu, current->pid);
 	last_cpupid = folio_xchg_last_cpupid(folio, this_cpupid);
 
 	if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) &&
-	    !node_is_toptier(src_nid) && !cpupid_valid(last_cpupid))
+			!node_is_toptier(src_nid) && !cpupid_valid(last_cpupid))
 		return false;
 
 	/*

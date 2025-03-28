@@ -36,6 +36,11 @@ static const struct bus_type memory_tier_subsys = {
 	.dev_name = "memory_tier",
 };
 
+int colloid_local_lat_gt_remote = 0;
+EXPORT_SYMBOL(colloid_local_lat_gt_remote);
+int colloid_nid_of_interest = NUMA_NO_NODE;
+EXPORT_SYMBOL(colloid_nid_of_interest);
+
 #ifdef CONFIG_NUMA_BALANCING
 /**
  * folio_use_access_time - check if a folio reuses cpupid for page access time
@@ -44,13 +49,22 @@ static const struct bus_type memory_tier_subsys = {
  * folio's _last_cpupid field is repurposed by memory tiering. In memory
  * tiering mode, cpupid of slow memory folio (not toptier memory) is used to
  * record page access time.
+ * If we enabled Colloid, folios from both slow memory as well as from
+ * colloid_nid_of_interest will use cpupid to record access time.
  *
  * Return: the folio _last_cpupid is used to record page access time
  */
 bool folio_use_access_time(struct folio *folio)
 {
-	return (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) &&
-	       !node_is_toptier(folio_nid(folio));
+	if ((sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) &&
+	       !node_is_toptier(folio_nid(folio)))
+		return true;
+	if ((sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) &&
+						 (sysctl_numa_balancing_mode & NUMA_BALANCING_COLLOID) &&
+						 !(sysctl_numa_balancing_mode & NUMA_BALANCING_NORMAL) &&
+				 (folio_nid(folio) == READ_ONCE(colloid_nid_of_interest)))
+		return true;
+	return false;
 }
 #endif
 
@@ -115,11 +129,6 @@ static int top_tier_adistance;
  */
 static struct demotion_nodes *node_demotion __read_mostly;
 #endif /* CONFIG_MIGRATION */
-
-int colloid_local_lat_gt_remote = 0;
-EXPORT_SYMBOL(colloid_local_lat_gt_remote);
-int colloid_nid_of_interest = NUMA_NO_NODE;
-EXPORT_SYMBOL(colloid_nid_of_interest);
 
 static BLOCKING_NOTIFIER_HEAD(mt_adistance_algorithms);
 

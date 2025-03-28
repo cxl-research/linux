@@ -40,6 +40,8 @@
 
 #include "internal.h"
 
+extern int colloid_nid_of_interest;
+
 bool can_change_pte_writable(struct vm_area_struct *vma, unsigned long addr,
 			     pte_t pte)
 {
@@ -90,7 +92,6 @@ static long change_pte_range(struct mmu_gather *tlb,
 	pte_t *pte, oldpte;
 	spinlock_t *ptl;
 	long pages = 0;
-	int target_node = NUMA_NO_NODE;
 	bool prot_numa = cp_flags & MM_CP_PROT_NUMA;
 	bool uffd_wp = cp_flags & MM_CP_UFFD_WP;
 	bool uffd_wp_resolve = cp_flags & MM_CP_UFFD_WP_RESOLVE;
@@ -99,11 +100,6 @@ static long change_pte_range(struct mmu_gather *tlb,
 	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
 	if (!pte)
 		return -EAGAIN;
-
-	/* Get target node for single threaded private VMAs */
-	if (prot_numa && !(vma->vm_flags & VM_SHARED) &&
-	    atomic_read(&vma->vm_mm->mm_users) == 1)
-		target_node = numa_node_id();
 
 	flush_tlb_batched_pending(vma->vm_mm);
 	arch_enter_lazy_mmu_mode();
@@ -150,17 +146,21 @@ static long change_pte_range(struct mmu_gather *tlb,
 				 * a single-threaded process is running on.
 				 */
 				nid = folio_nid(folio);
-				if (target_node == nid)
-					continue;
 				toptier = node_is_toptier(nid);
 
 				/*
-				 * Skip scanning top tier node if normal numa
-				 * balancing is disabled
+				 * Proceed further with scanning pages ONLY IF
+				 * (node is not top-tier) OR (normal numa balancing is disabled)
+				 * OR (Colloid is enabled and page is on nid_of_interest)
+				 * In every other case, skip scanning.
 				 */
-				if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_NORMAL) &&
-				    toptier)
+				if (toptier &&
+						!(sysctl_numa_balancing_mode & NUMA_BALANCING_NORMAL) &&
+						!((sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) &&
+							(sysctl_numa_balancing_mode & NUMA_BALANCING_COLLOID) &&
+							(nid == READ_ONCE(colloid_nid_of_interest))))
 					continue;
+
 				if (folio_use_access_time(folio))
 					folio_xchg_access_time(folio,
 						jiffies_to_msecs(jiffies));

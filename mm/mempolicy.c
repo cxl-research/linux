@@ -109,6 +109,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/printk.h>
 #include <linux/swapops.h>
+#include <linux/memory-tiers.h>
 
 #include <asm/tlbflush.h>
 #include <asm/tlb.h>
@@ -2822,9 +2823,14 @@ int mpol_misplaced(struct folio *folio, struct vm_fault *vmf,
 		BUG();
 	}
 
-	/* Migrate the folio towards the node whose CPU is referencing it */
+	/* Migrate the folio towards the node whose CPU is referencing it
+	 * OR away from it if COLLOID is enabled.
+	 */
 	if (pol->flags & MPOL_F_MORON) {
-		polnid = thisnid;
+		if (!node_is_toptier(curnid))
+			polnid = thisnid;
+		else
+			polnid = next_demotion_node(curnid);
 
 		if (!should_numa_migrate_memory(current, folio, curnid,
 						thiscpu))
