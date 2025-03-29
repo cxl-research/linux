@@ -1938,19 +1938,27 @@ bool should_numa_migrate_memory(struct task_struct *p, struct folio *folio,
 		unsigned int latency, th, def_th;
 
 		pgdat = NODE_DATA(dst_nid);
+		/* in case of CXL->DRAM migration, if there is enough space
+		 * in DRAM, skip the hot threshold check.
+		 */
+		if (pgdat_free_space_enough(pgdat) &&
+		    !node_is_toptier(src_nid)) {
+			pgdat->nbp_threshold = 0;
+			goto colloid_migrate_check;
+		}
+
 		def_th = sysctl_numa_balancing_hot_threshold;
 		rate_limit = sysctl_numa_balancing_promote_rate_limit << \
 			(20 - PAGE_SHIFT);
 		numa_promotion_adjust_threshold(pgdat, rate_limit, def_th);
-
 		th = pgdat->nbp_threshold ? : def_th;
 		latency = numa_hint_fault_latency(folio);
 		if (latency >= th)
 			return false;
 
+colloid_migrate_check:
 		if (sysctl_numa_balancing_mode & NUMA_BALANCING_COLLOID)
 			return can_migrate_colloid(src_nid, dst_nid);
-
 		return !numa_promotion_rate_limit(pgdat, rate_limit,
 								folio_nr_pages(folio));
 	}

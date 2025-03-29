@@ -2765,6 +2765,10 @@ int mpol_misplaced(struct folio *folio, struct vm_fault *vmf,
 	if (!(pol->flags & MPOL_F_MOF))
 		goto out;
 
+	/* Colloid DRAM->CXL migration takes precedence over mempolicy */
+	if (folio_use_access_time(folio) && node_is_toptier(curnid))
+		goto colloid_check;
+
 	switch (pol->mode) {
 	case MPOL_INTERLEAVE:
 		polnid = interleave_nid(pol, ilx);
@@ -2826,6 +2830,7 @@ int mpol_misplaced(struct folio *folio, struct vm_fault *vmf,
 	/* Migrate the folio towards the node whose CPU is referencing it
 	 * OR away from it if COLLOID is enabled.
 	 */
+colloid_check:
 	if (pol->flags & MPOL_F_MORON) {
 		if (!node_is_toptier(curnid))
 			polnid = thisnid;
@@ -2841,7 +2846,6 @@ int mpol_misplaced(struct folio *folio, struct vm_fault *vmf,
 		ret = polnid;
 out:
 	mpol_cond_put(pol);
-
 	return ret;
 }
 
