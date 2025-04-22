@@ -1946,6 +1946,8 @@ bool should_numa_migrate_memory(struct task_struct *p, struct folio *folio,
 			pgdat->nbp_threshold = 0;
 			goto colloid_migrate_check;
 		}
+		// if (!node_is_toptier(src_nid))
+		// 	return false;
 
 		def_th = sysctl_numa_balancing_hot_threshold;
 		rate_limit = sysctl_numa_balancing_promote_rate_limit << \
