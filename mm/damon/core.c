@@ -2213,6 +2213,56 @@ static void kdamond_init_intervals_sis(struct damon_ctx *ctx)
 	}
 }
 
+struct damon_ctx_fake ctx_for_mods;
+EXPORT_SYMBOL_GPL(ctx_for_mods);
+
+static void destroy_fake_ctx(struct damon_ctx_fake *ctx)
+{
+	if (ctx->nr_targets == 0)
+		return;
+
+	for (int t=0; t < ctx->nr_targets; t++) {
+		struct damon_target_fake *target = &ctx->targets[t];
+		kfree(target->regions);
+	}
+	kfree(ctx->targets);
+	ctx->targets = NULL;
+	ctx->nr_targets = 0;
+}
+
+static void init_fake_ctx(struct damon_ctx *src, struct damon_ctx_fake *dst)
+{
+	struct damon_target *t;
+	struct damon_region *r;
+	unsigned int targetidx = 0, regionidx = 0;
+
+	damon_for_each_target(t, src) {
+		targetidx++;
+	}
+
+	dst->nr_targets = targetidx;
+	dst->targets = kmalloc_array(targetidx,
+			sizeof(struct damon_target_fake), GFP_KERNEL);
+
+	targetidx = 0;
+	damon_for_each_target(t, src) {
+		struct damon_target_fake *target = &dst->targets[targetidx];
+		target->nr_regions = damon_nr_regions(t);
+		target->regions = kmalloc_array(target->nr_regions,
+				sizeof(struct damon_region_fake), GFP_KERNEL);
+
+		regionidx = 0;
+		damon_for_each_region(r, t) {
+			struct damon_region_fake *region = &target->regions[regionidx];
+			region->start = r->ar.start;
+			region->end = r->ar.end;
+			region->nr_accesses = r->nr_accesses;
+			region->nr_pebs_samples = r->nr_pebs_samples;
+			regionidx++;
+		}
+	}
+}
+
 /*
  * The monitoring daemon that runs as a kernel thread
  */
@@ -2222,9 +2272,12 @@ static int kdamond_fn(void *data)
 	struct damon_target *t;
 	struct damon_region *r, *next;
 	unsigned int max_nr_accesses = 0;
-	unsigned long sz_limit = 0;
+	unsigned long sz_limit = 0, flags;
 
-	pr_debug("kdamond (%d) starts\n", current->pid);
+	ctx_for_mods.targets = NULL;
+	ctx_for_mods.nr_targets = 0;
+	spin_lock_init(&ctx_for_mods.lock);
+	pr_info("kdamond (%d) starts\n", current->pid);
 
 	complete(&ctx->kdamond_started);
 	kdamond_init_intervals_sis(ctx);
@@ -2269,6 +2322,11 @@ static int kdamond_fn(void *data)
 			max_nr_accesses = ctx->ops.check_accesses(ctx);
 
 		if (ctx->passed_sample_intervals >= next_aggregation_sis) {
+			spin_lock_irqsave(&ctx_for_mods.lock, flags);
+			destroy_fake_ctx(&ctx_for_mods);
+			init_fake_ctx(ctx, &ctx_for_mods);
+			spin_unlock_irqrestore(&ctx_for_mods.lock, flags);
+
 			if (ctx->ops.pre_aggregation)
 				max_nr_accesses = ctx->ops.pre_aggregation(ctx);
 			kdamond_merge_regions(ctx,
@@ -2308,6 +2366,10 @@ static int kdamond_fn(void *data)
 		}
 	}
 done:
+	spin_lock_irqsave(&ctx_for_mods.lock, flags);
+	destroy_fake_ctx(&ctx_for_mods);
+	spin_unlock_irqrestore(&ctx_for_mods.lock, flags);
+
 	damon_for_each_target(t, ctx) {
 		damon_for_each_region_safe(r, next, t)
 			damon_destroy_region(r, t);

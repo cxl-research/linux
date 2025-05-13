@@ -14,6 +14,7 @@
 #include <linux/types.h>
 #include <linux/random.h>
 #include <linux/perf_event.h>
+#include <linux/spinlock.h>
 
 /* Minimal region size.  Every damon_region is aligned by this. */
 #define DAMON_MIN_REGION	PAGE_SIZE
@@ -714,7 +715,24 @@ struct damon_ctx {
 	struct damon_pebs_ctx pebs_ctx;
 };
 
-static inline struct damon_region *damon_next_region(struct damon_region *r)
+struct damon_region_fake {
+	unsigned long start, end;
+	unsigned int nr_accesses, nr_pebs_samples;;
+};
+
+struct damon_target_fake {
+	struct damon_region_fake *regions;
+	int nr_regions;
+};
+
+struct damon_ctx_fake {
+	struct damon_target_fake *targets;
+	int nr_targets;
+	spinlock_t lock;
+};
+
+static inline struct damon_region *
+damon_next_region(struct damon_region *r)
 {
 	return container_of(r->list.next, struct damon_region, list);
 }
