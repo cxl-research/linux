@@ -28,11 +28,6 @@ static const uint64_t DAMON_PEBS_EVENTS[] = {
 	ALL_STORES_EVENT
 };
 
-struct aggregation_metadata {
-	unsigned int max_nr_samples;
-	unsigned int max_sample_period_sum;
-} metapebs_vaddr;
-
 /*
  * 't->pid' should be the pointer to the relevant 'struct pid' having reference
  * count.  Caller must put the returned task, unless it is NULL.
@@ -347,11 +342,6 @@ static void __damon_va_check_access(struct damon_region *r,
 {
 	r->nr_pebs_samples++;
 	r->pebs_sample_period_sum += s->period;
-
-	if (r->nr_pebs_samples > metapebs_vaddr.max_nr_samples)
-		metapebs_vaddr.max_nr_samples = r->nr_pebs_samples;
-	if (r->pebs_sample_period_sum > metapebs_vaddr.max_sample_period_sum)
-		metapebs_vaddr.max_sample_period_sum = r->pebs_sample_period_sum;
 }
 
 static bool __damon_va_check_access_sample(struct damon_ctx *ctx,
@@ -428,37 +418,96 @@ out_mask:
 	return 0;
 }
 
+static int _log10(unsigned long n)
+{
+	int i = 0;
+	while (n > 9) {
+		n /= 10;
+		i++;
+	}
+	return i;
+}
+
+static unsigned int _pow10(unsigned int exp)
+{
+	unsigned int res = 1;
+	while (exp > 0) {
+		res *= 10;
+		exp--;
+	}
+	return res;
+}
+
+/*
+ * New nr_accesses algo.
+ * hotness of a region is the sum of periods across all samples
+ * that belong to the region divided by region sz.
+ *
+ * nbuckets = sample_intervals_per_aggr_interval / 10
+ * avg_hotness = sum of all periods / sum of all region sz
+ * for each region:
+ * - hotness_score = (hotness(region) / avg_hotness) * 1E5
+ * - hotindex = min(log10(hotness_score), 10)
+ *
+ * -   region->nr_accesses = (sample_intervals_per_aggr_interval \
+ * - 																					* hotindex / 10) + \
+ * - 					(hotness_score * nbuckets / 10^(hotindex + 1)) \
+ */
+
 static unsigned int damon_update_nr_accesses(struct damon_ctx *ctx)
 {
+	unsigned long total_sz, total_period_sum, avghot, hotness, hscore;
+	unsigned int sis_per_agi, buckets_per_decpt, hidx, max_nr_accesses;
 	struct damon_target *t;
 	struct damon_region *r;
-	unsigned int max_nr_accesses = 0, factor;
 
-	factor = ctx->attrs.aggr_interval / \
-			(ctx->attrs.sample_interval ?  ctx->attrs.sample_interval : 1);
+	max_nr_accesses = 0;
+	sis_per_agi = ctx->attrs.aggr_interval / ctx->attrs.sample_interval;
+	buckets_per_decpt = sis_per_agi / 10;
+
 	damon_for_each_target(t, ctx) {
+		total_sz = total_period_sum = 0;
 		damon_for_each_region(r, t) {
-			unsigned int incbp = factor * (metapebs_vaddr.max_nr_samples ? \
-					(10000 * r->nr_pebs_samples / metapebs_vaddr.max_nr_samples) : 0);
-			unsigned int decbp = 10000 * r->last_nr_accesses;
-			int delta = incbp - decbp;
+			if (r->nr_pebs_samples == 0)
+				continue;
+			total_sz += damon_sz_region(r);
+			total_period_sum += r->pebs_sample_period_sum;
+		}
 
-			if (delta + r->nr_accesses_bp <= 0)
+		if (total_sz == 0)
+			continue;
+
+		avghot = (10000000UL * total_period_sum) / total_sz;
+
+		damon_for_each_region(r, t) {
+			if (r->nr_pebs_samples == 0) {
 				r->nr_accesses_bp = 0;
-			else
-				r->nr_accesses_bp += delta;
+				r->nr_accesses = 0;
+				continue;
+			}
 
-			r->nr_accesses = r->nr_accesses_bp / 10000;
-			max_nr_accesses = max(r->nr_accesses, max_nr_accesses);
-			r->nr_pebs_samples = 0;
-			r->pebs_sample_period_sum = 0;
+			hotness = (10000000UL * r->pebs_sample_period_sum) /
+				damon_sz_region(r);
+
+			// Prevent division by zero
+			if (avghot == 0)
+				hscore = 0;
+			else
+				hscore = (hotness * 100000UL) / avghot;
+
+			hidx = max(0, min(_log10(hscore), 10));
+
+			r->nr_accesses = (sis_per_agi * hidx / 10) +
+				(buckets_per_decpt * hscore / _pow10(hidx + 1));
+			r->nr_accesses_bp = r->nr_accesses * 10000U;
+
+			if (max_nr_accesses < r->nr_accesses)
+				max_nr_accesses = r->nr_accesses;
 		}
 	}
-
-	metapebs_vaddr.max_nr_samples = 0;
-	metapebs_vaddr.max_sample_period_sum = 0;
 	return max_nr_accesses;
 }
+
 
 /*
  * Functions for the target validity check and cleanup

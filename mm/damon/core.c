@@ -1224,7 +1224,6 @@ static void kdamond_reset_aggregated(struct damon_ctx *c)
 		damon_for_each_region(r, t) {
 			trace_damon_aggregated(ti, r, damon_nr_regions(t));
 			r->last_nr_accesses = r->nr_accesses;
-			r->nr_accesses = 0;
 			r->nr_accesses = r->nr_accesses_bp / 10000;
 			r->nr_pebs_samples = 0;
 			r->pebs_sample_period_sum = 0;
