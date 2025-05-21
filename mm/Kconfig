@@ -1360,5 +1360,6 @@ config PT_RECLAIM
 
 
 source "mm/damon/Kconfig"
+source "mm/congestier/Kconfig"
 
 endmenu

@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+menu "Congestion Tiering"
+
+config CONGESTIER
+	bool "Congestion Tiering"
+	help
+	  A framework for tiering between DRAM and CXL memory for
+		performance in a bandwidth-constrained environment.
+	  
+choice
+	prompt "Page Temperature Tracker"
+	depends on CONGESTIER
+	default CONGESTIER_PGTEMP_PEBS
+	help
+	  Framework for tracking memory temperature.
+	  This provides input for tiering decisions.
+		Default is PEBS.
+
+config CONGESTIER_PGTEMP_PEBS
+	bool "PEBS"
+	depends on CONGESTIER
+	help
+	  PEBS (Precise Event Based Sampling) is a hardware feature
+	  that allows for precise sampling of events in the CPU.
+	  This option enables the use of PEBS for tracking memory temperature.
+	  This is the default option.
+
+		If PEBS is the tracker, then we create a device "/dev/pebs".
+		This device must be mapped by a user process and filled with
+		temperature data. Temperature is measured at 2MB granularity.
+		For each 2MB block, its temperature is the sum of periods 
+		of all PEBS samples that originate from the block.
+
+config CONGESTIER_PGTEMP_DAMON
+	bool "DAMON"
+	depends on CONGESTIER
+	help
+	  Use DAMON (Data Access Monitoring) for tracking memory temperature.
+		DAMON must be running on the targeted applications.
+
+config CONGESTIER_PGTEMP_TELESCOPE
+	bool "TELESCOPE"
+	depends on CONGESTIER
+	help
+	  Use TELESCOPE for tracking memory temperature.
+		TELESCOPE must be running on the targeted applications.
+endchoice
+
+endmenu
