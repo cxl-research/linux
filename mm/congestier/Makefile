@@ -2,3 +2,4 @@
 
 obj-y := core.o
 obj-y += sysfs.o
+obj-$(CONFIG_CONGESTIER_PGTEMP_PEBS) += pgtemp.o
