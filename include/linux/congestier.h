@@ -9,12 +9,14 @@
 #include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/kthread.h>
+#include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
 
+#define CONGESTIER_BUF_SHIFT(order) ((1U << (order + 11)) - 1)
 #define CONGESTIER_PEBS_BUFSZ_NZ(order) \
-		((1UL << ((order) - 1)) * PAGE_SIZE)
+		(((1UL << ((order) - 1)) + 1) * PAGE_SIZE)
 #define CONGESTIER_PEBS_BUFSZ(order) \
 		((order) ? CONGESTIER_PEBS_BUFSZ_NZ(order) : 0UL)
 

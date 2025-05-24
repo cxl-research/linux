@@ -16,7 +16,7 @@
 struct pheader {
 	uint64_t head;
 	uint64_t tail;
-	char __reserved[16];
+	uint64_t tail_start;
 };
 
 struct psample {
@@ -27,7 +27,6 @@ struct psample {
 };
 
 struct pg_temp_block {
-	/* HOTNESS = SUM(Sample Periods), halved every epoch */
 	uint64_t ld_temp;
 	uint64_t period_sum_this_epoch_ld;
 	uint64_t nr_samples_this_epoch_ld;
@@ -59,8 +58,6 @@ static struct pg_temp_target targets[MAX_PGTEMP_TARGETS];
 static int nr_targets = 0;
 static int epochid = 0;
 
-/* One class to track new entries */
-/* At end of every epoch, scrub the new list into the correct temp classes */
 static struct temperature_class tmpcls[NR_TEMPERATURE_CLASSES + 1];
 #define NEW_BLK_CLS (NR_TEMPERATURE_CLASSES)
 
@@ -103,7 +100,6 @@ static inline int new_target_idx(pid_t pid)
 	targets[nr_targets].pid = pid;
 	targets[nr_targets].nr_blocks = 0;
 	xa_init_flags(&(targets[nr_targets].blocks), XA_FLAGS_LOCK_BH);
-	// xa_init(&(targets[nr_targets].blocks));
 	targets[nr_targets].epoch_created = epochid;
 
 	return nr_targets++;
@@ -123,7 +119,6 @@ static void congestier_usleep(unsigned long us)
 		schedule_timeout_idle(usecs_to_jiffies(us));
 	else
 		usleep_range_idle(us, us + 1);
-	// msleep(us / 1000);
 }
 
 int pebs_tracking_start(void)
@@ -141,6 +136,8 @@ int pebs_tracking_start(void)
 	}
 	mutex_unlock(&__tempctx.ctx_lock);
 
+	printk(KERN_INFO "START returned %d\n", err);
+
 	return err;
 }
 
@@ -150,34 +147,37 @@ int pebs_tracking_stop(void)
 
 	mutex_lock(&__tempctx.ctx_lock);
 	task = __tempctx.task;
-	if (task) {
-		get_task_struct(task);
+	if (__tempctx.task) {
+		get_task_struct(__tempctx.task);
 		mutex_unlock(&__tempctx.ctx_lock);
-		kthread_stop_put(task);
+		kthread_stop_put(__tempctx.task);
+		__tempctx.task = NULL;
+		printk(KERN_INFO "PGTemp PEBS tracking stopped\n");
 		return 0;
 	}
 	mutex_unlock(&__tempctx.ctx_lock);
 
+	printk(KERN_INFO "STOP failed\n");
+
 	return -EPERM;
 }
 
-/* Release all blocks of this class - class must be scrubbed first */
-static void free_temperature_class(int clsidx)
+static void debug_print_temperature_classes(void)
 {
-	struct pg_temp_block *blk;
-	struct temperature_class *cls = &tmpcls[clsidx];
-	struct list_head *pos, *n;
+	char *buf = kzalloc(1024, GFP_KERNEL);
 
-	mutex_lock(&cls->templock);
-	list_for_each_safe(pos, n, &cls->blocks) {
-		blk = list_entry(pos, struct pg_temp_block, temper_class);
-		list_del(pos);
-		cls->nr_blocks--;
-		xa_erase(&(targets[blk->target_idx].blocks), blk->blocknum);
-		kfree(blk);
+	strcpy(buf, "TMPCLS ");
+	for (int i = 0; i <= NR_TEMPERATURE_CLASSES; ++i)
+	{
+		struct temperature_class *cls = &tmpcls[i];
+		int nr_blocks = cls->nr_blocks;
+		if (nr_blocks > 0) {
+			sprintf(buf + strlen(buf), "%d:%d ", i, nr_blocks);
+		}
 	}
-	mutex_unlock(&cls->templock);
-	cls->nr_blocks = 0;
+
+	printk(KERN_INFO "%s\n", buf);
+	kfree(buf);
 }
 
 /* update each entry and make consistent */
@@ -194,7 +194,13 @@ static void scrub_temperature_class(int clsidx)
 		blk = list_entry(pos, struct pg_temp_block, temper_class);
 
 		epochs_passed = epochid - blk->last_updated_epoch;
-		blk->ld_temp >>= epochs_passed;
+		blk->ld_temp += blk->period_sum_this_epoch_ld;
+
+		if (epochs_passed < NR_TEMPERATURE_CLASSES)
+			blk->ld_temp >>= epochs_passed;
+		else
+			blk->ld_temp = 0;
+
 		newclsidx = temp_class(blk->ld_temp);
 		blk->period_sum_this_epoch_ld = 0; /* reset for next epoch */
 		blk->nr_samples_this_epoch_ld = 0;
@@ -212,44 +218,55 @@ static void scrub_temperature_class(int clsidx)
 	mutex_unlock(&cls->templock);
 }
 
+/* Release all blocks of this class - class must be scrubbed first */
+static void free_temperature_class(int clsidx)
+{
+	struct pg_temp_block *blk;
+	struct temperature_class *cls = &tmpcls[clsidx];
+	struct list_head *pos, *n;
+
+	scrub_temperature_class(clsidx);
+
+	mutex_lock(&cls->templock);
+	list_for_each_safe(pos, n, &cls->blocks) {
+		blk = list_entry(pos, struct pg_temp_block, temper_class);
+		list_del(pos);
+		cls->nr_blocks--;
+		xa_erase(&(targets[blk->target_idx].blocks), blk->blocknum);
+		kfree(blk);
+	}
+	mutex_unlock(&cls->templock);
+	cls->nr_blocks = 0;
+}
+
 static int pebs_track_fn(void *data)
 {
+	char *pebs_buffer_data = (char*)pebs_sample_buf + PAGE_SIZE;
 	struct pheader *hdr;
 	struct psample *smp;
 	struct pg_temp_block *blk;
-	uint64_t head, tail, offset, bufsz, blocknum, period, epspassed;
-	unsigned long start, end, dur_usecs;
-	int pid, blockshift, targetidx, err;
-	int oldcls, newcls, newblks, minor_update_blks, major_update_blks;
+	uint64_t head, tail, offset;
+	uint64_t blocknum, period, epspassed, temper, dur_usecs;
+	uint64_t start, end, scrub_start, scrub_end, scrub_usecs;
+	int pid, blockshift, targetidx, err, oldcls, newcls;
+	int newblks, minor_update_blks, major_update_blks;
 
-	printk(KERN_INFO "PEBS Page Temperature Tracking started %d\n", preempt_count());
+	printk(KERN_INFO "PEBS Page Temperature Tracking started\n");
 
 	hdr = (struct pheader *)pebs_sample_buf;
-	bufsz = CONGESTIER_PEBS_BUFSZ(pebs_buf_pg_order);
 	blockshift = PAGE_SHIFT + pgtemp_granularity_order;
 	newblks = minor_update_blks = major_update_blks = 0;
 	init_temperature_classes();
 
 	while (!pebs_track_need_stop()) {
-		/*
-		 * TODO: Implement the logic to track page temperature
-		 * and update the temperature classes.
-		 *
-		 * Read `psample's from pebs_sample_buf.
-		 * For each sample, find target, and find block.
-		 * Find temperature class (old and new). Lock both.
-		 * xa_store the updated hotness.
-		 * Move old->new temperature class. unlock both classes.
-		 * Occasionally scrub the whole xarray, to delete the old blocks.
-		 */
-		start = jiffies_to_usecs(READ_ONCE(jiffies));
+		start = ktime_get_ns();
 		head = READ_ONCE(hdr->head);
-		tail = READ_ONCE(hdr->tail);
+		tail = max(READ_ONCE(hdr->tail), READ_ONCE(hdr->tail_start));
 
 		while (tail < head) {
-			offset = sizeof(*hdr) + tail * sizeof(struct psample);
-			offset %= bufsz;
-			smp = (struct psample *)((char*)pebs_sample_buf + offset);
+			offset = tail * sizeof(struct psample);
+			offset &= CONGESTIER_BUF_SHIFT(pebs_buf_pg_order);
+			smp = (struct psample *)(pebs_buffer_data + offset);
 
 			if (smp->is_store)
 				goto skip_this_sample;
@@ -264,9 +281,7 @@ static int pebs_track_fn(void *data)
 				if (targetidx < 0)
 					goto out;
 			}
-					
-			// xa_lock_bh(&(targets[targetidx].blocks));
-			// xa_lock(&(targets[targetidx].blocks));
+
 			blk = xa_load(&(targets[targetidx].blocks), blocknum);
 			if (!blk) {
 				blk = kmalloc(sizeof(*blk), GFP_KERNEL);
@@ -302,9 +317,15 @@ static int pebs_track_fn(void *data)
 				blk->nr_samples_this_epoch_ld++;
 				++minor_update_blks;
 			} else {
-				epspassed = epochid - blk->last_updated_epoch;
+				epspassed = epochid - blk->last_updated_epoch;					
 				oldcls = temp_class(blk->ld_temp);
-				blk->ld_temp = ((blk->ld_temp + blk->period_sum_this_epoch_ld) >> epspassed);
+				temper = blk->ld_temp + blk->period_sum_this_epoch_ld;
+
+				if (epspassed >= NR_TEMPERATURE_CLASSES)
+					blk->ld_temp = 0;
+				else
+					blk->ld_temp = (temper >> epspassed);
+
 				newcls = temp_class(blk->ld_temp);
 				blk->period_sum_this_epoch_ld = period;
 				blk->nr_samples_this_epoch_ld = 1;
@@ -325,26 +346,32 @@ static int pebs_track_fn(void *data)
 				}
 			}
 skip_this_sample:
-			// xa_unlock_bh(&(targets[targetidx].blocks));
-			// xa_unlock(&(targets[targetidx].blocks));
 			++tail;
 		}
 
-		// printk(KERN_INFO "PEBS preempt count: %d\n", preempt_count());
-		scrub_temperature_class(NEW_BLK_CLS);
-		// scrub_temperature_class(0);
-		// free_temperature_class(0);
+		scrub_start = ktime_get_ns();
+		for (int tc = NR_TEMPERATURE_CLASSES; tc >= 0; --tc)
+			scrub_temperature_class(tc);
+		scrub_end = ktime_get_ns();
+		scrub_usecs = (scrub_end - scrub_start) / 1000;
+		debug_print_temperature_classes();
 
 		WRITE_ONCE(hdr->tail, tail);
 		++epochid;
-		end = jiffies_to_usecs(READ_ONCE(jiffies));
-		dur_usecs = end - start;
-		printk(KERN_INFO "PEBS tracking took %lu usecs: (%d,%d,%d) %d\n", 
-				dur_usecs, newblks, minor_update_blks, major_update_blks, preempt_count());
-		end = jiffies_to_usecs(READ_ONCE(jiffies));
-		dur_usecs = end - start;
+		end = ktime_get_ns();
+		dur_usecs = (end - start) / 1000;
+		printk(KERN_INFO "PEBS %llu(scr=%llu) usecs: (%llu %llu) (%d,%d,%d)\n", 
+				dur_usecs, scrub_usecs, head, tail,
+				newblks, minor_update_blks, major_update_blks);
+		end = ktime_get_ns();
+		dur_usecs = (end - start) / 1000;
 
-		congestier_usleep(pebs_epoch_usecs - dur_usecs);
+		if (dur_usecs < pebs_epoch_usecs)
+			congestier_usleep(pebs_epoch_usecs - dur_usecs);
+		else {
+			printk(KERN_WARNING "PEBS tracking took too long: %llu usecs\n", dur_usecs);
+			congestier_usleep(pebs_epoch_usecs);
+		}
 	}
 
 	return 0;
