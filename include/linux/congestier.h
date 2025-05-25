@@ -28,6 +28,7 @@ enum tiering_mode {
 
 extern int promote_pg_sec;
 extern int epoch_usecs;
+extern enum tiering_mode tiering_mode;
 
 int tiering_start(void);
 int tiering_stop(void);
@@ -46,5 +47,7 @@ extern void *pebs_sample_buf;
 
 int pebs_tracking_start(void);
 int pebs_tracking_stop(void);
+int pebs_track_epoch_work(int epoch_id);
+void pebs_track_init(void);
 
 #endif /* CONFIG_CONGESTIER_PGTEMP_PEBS */

@@ -22,7 +22,7 @@ static const char *tiering_mode_str[] = {
 	[TIERING_MODE_ON] = "on",
 };
 
-static enum tiering_mode tiering_mode = TIERING_MODE_OFF;
+enum tiering_mode tiering_mode = TIERING_MODE_OFF;
 
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
 
