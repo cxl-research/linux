@@ -51,7 +51,6 @@ struct temperature_class {
 
 struct pebs_track_ctx {
 	struct task_struct *task;
-	struct mutex ctx_lock;
 } __tempctx;
 
 static struct pg_temp_target targets[MAX_PGTEMP_TARGETS];
@@ -125,7 +124,6 @@ int pebs_tracking_start(void)
 {
 	int err = -EBUSY;
 
-	mutex_lock(&__tempctx.ctx_lock);
 	if (!__tempctx.task) {
 		err = 0;
 		__tempctx.task = kthread_run(pebs_track_fn, NULL, "pebs_track");
@@ -134,31 +132,22 @@ int pebs_tracking_start(void)
 			__tempctx.task = NULL;
 		}
 	}
-	mutex_unlock(&__tempctx.ctx_lock);
 
 	printk(KERN_INFO "START returned %d\n", err);
-
 	return err;
 }
 
 int pebs_tracking_stop(void)
 {
-	struct task_struct *task;
-
-	mutex_lock(&__tempctx.ctx_lock);
-	task = __tempctx.task;
 	if (__tempctx.task) {
 		get_task_struct(__tempctx.task);
-		mutex_unlock(&__tempctx.ctx_lock);
 		kthread_stop_put(__tempctx.task);
 		__tempctx.task = NULL;
 		printk(KERN_INFO "PGTemp PEBS tracking stopped\n");
 		return 0;
 	}
-	mutex_unlock(&__tempctx.ctx_lock);
 
 	printk(KERN_INFO "STOP failed\n");
-
 	return -EPERM;
 }
 
@@ -366,11 +355,11 @@ skip_this_sample:
 		end = ktime_get_ns();
 		dur_usecs = (end - start) / 1000;
 
-		if (dur_usecs < pebs_epoch_usecs)
-			congestier_usleep(pebs_epoch_usecs - dur_usecs);
+		if (dur_usecs < epoch_usecs)
+			congestier_usleep(epoch_usecs - dur_usecs);
 		else {
 			printk(KERN_WARNING "PEBS tracking took too long: %llu usecs\n", dur_usecs);
-			congestier_usleep(pebs_epoch_usecs);
+			congestier_usleep(epoch_usecs);
 		}
 	}
 

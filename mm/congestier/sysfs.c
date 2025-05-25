@@ -15,6 +15,107 @@
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 
+int epoch_usecs = 1E6; /* 1 second by default */
+
+static const char *tiering_mode_str[] = {
+	[TIERING_MODE_OFF] = "off",
+	[TIERING_MODE_ON] = "on",
+};
+
+static enum tiering_mode tiering_mode = TIERING_MODE_OFF;
+
+#ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
+
+int pgtemp_granularity_order = 9; /* 2MB by default */
+int pebs_buf_pg_order = 0;
+void *pebs_sample_buf = NULL;
+static enum pg_temp_pebs_state pebs_hottrack_state = TRACK_HOTNESS_OFF;
+
+static const char *pebs_hottrack_state_str[] = {
+	[TRACK_HOTNESS_OFF] = "off",
+	[TRACK_HOTNESS_ON] = "on",
+};
+
+#endif
+
+static ssize_t tiering_mode_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	enum tiering_mode mode = READ_ONCE(tiering_mode);
+	int len = strlen(tiering_mode_str[mode]);
+	sysfs_emit(buf, "%s", tiering_mode_str[mode]);
+	return len;
+}
+
+static ssize_t tiering_mode_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int err;
+	enum tiering_mode oldmode, newmode;
+
+	oldmode = READ_ONCE(tiering_mode);
+
+	if (!strncmp(buf, "off", 3)) {
+		newmode = TIERING_MODE_OFF;
+
+		if (oldmode == TIERING_MODE_OFF)
+			return 3;
+
+		if ((err = tiering_stop()))
+			return err;
+		WRITE_ONCE(tiering_mode, newmode);
+	} else if (!strncmp(buf, "on", 2)) {
+		newmode = TIERING_MODE_ON;
+
+		if (oldmode == TIERING_MODE_ON)
+			return 2;
+
+#ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
+		/* PGTemp Tracking must be turned ON */
+		if (pebs_hottrack_state != TRACK_HOTNESS_ON) {
+			printk(KERN_ERR "PGTemp PEBS tracking must be ON to enable tiering\n");
+			return -EPERM;
+		}
+#endif
+		if ((err = tiering_start()))
+			return err;
+		WRITE_ONCE(tiering_mode, newmode);
+	} else {
+		return -EINVAL;
+	}
+
+	return count;
+}
+
+static struct kobj_attribute tiering_mode_attr =
+		__ATTR_RW(tiering_mode);
+
+static ssize_t epoch_usecs_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	int usecs = READ_ONCE(epoch_usecs);
+	return sysfs_emit(buf, "%d\n", usecs);
+}
+
+static ssize_t epoch_usecs_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int err, usecs;
+
+	err = kstrtoint(buf, 0, &usecs);
+	if (err)
+		return err;
+
+	if (usecs < 1000 || usecs > 1E8)
+		return -EINVAL;
+
+	WRITE_ONCE(epoch_usecs, usecs);
+	return count;
+}
+
+static struct kobj_attribute epoch_usecs_attr =
+	__ATTR_RW(epoch_usecs);
+
 static ssize_t prom_mbps_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
@@ -37,17 +138,6 @@ static ssize_t prom_mbps_store(struct kobject *kobj,
 static struct kobj_attribute prom_mbps_attr = __ATTR_RW(prom_mbps);
 
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
-
-int pgtemp_granularity_order = 9; /* 2MB by default */
-int pebs_buf_pg_order = 0;
-void *pebs_sample_buf = NULL;
-static enum pg_temp_pebs_state pebs_hottrack_state = TRACK_HOTNESS_OFF;
-int pebs_epoch_usecs = 1E6; /* 1 second by default */
-
-static const char *pebs_hottrack_state_str[] = {
-	[TRACK_HOTNESS_OFF] = "off",
-	[TRACK_HOTNESS_ON] = "on",
-};
 
 static ssize_t pgtemp_granularity_order_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
@@ -199,41 +289,16 @@ static ssize_t pebs_buf_pg_order_store(struct kobject *kobj,
 static struct kobj_attribute pebs_buf_pg_order_attr =
 	__ATTR_RW(pebs_buf_pg_order);
 
-static ssize_t pebs_epoch_usecs_show(struct kobject *kobj,
-		struct kobj_attribute *attr, char *buf)
-{
-	int usecs = READ_ONCE(pebs_epoch_usecs);
-	return sysfs_emit(buf, "%d\n", usecs);
-}
-
-static ssize_t pebs_epoch_usecs_store(struct kobject *kobj,
-		struct kobj_attribute *attr, const char *buf, size_t count)
-{
-	int err, usecs;
-
-	err = kstrtoint(buf, 0, &usecs);
-	if (err)
-		return err;
-
-	if (usecs < 1000 || usecs > 1E8)
-		return -EINVAL;
-
-	WRITE_ONCE(pebs_epoch_usecs, usecs);
-	return count;
-}
-
-static struct kobj_attribute pebs_epoch_usecs_attr =
-	__ATTR_RW(pebs_epoch_usecs);
-
 #endif /* CONFIG_CONGESTIER_PGTEMP_PEBS */
 
 static struct attribute *congestier_sysfs_attrs[] = {
 	&prom_mbps_attr.attr,
+	&tiering_mode_attr.attr,
+	&epoch_usecs_attr.attr,
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
 	&pebs_buf_pg_order_attr.attr,
 	&pgtemp_granularity_order_attr.attr,
 	&pebs_hottrack_state_attr.attr,
-	&pebs_epoch_usecs_attr.attr,
 #endif
 	NULL,
 };

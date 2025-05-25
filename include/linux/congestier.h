@@ -20,7 +20,17 @@
 #define CONGESTIER_PEBS_BUFSZ(order) \
 		((order) ? CONGESTIER_PEBS_BUFSZ_NZ(order) : 0UL)
 
+enum tiering_mode {
+	TIERING_MODE_OFF,
+	TIERING_MODE_ON,
+	NR_TIERING_MODES,
+};
+
 extern int promote_pg_sec;
+extern int epoch_usecs;
+
+int tiering_start(void);
+int tiering_stop(void);
 
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
 
@@ -32,7 +42,6 @@ enum pg_temp_pebs_state {
 
 extern int pgtemp_granularity_order;
 extern int pebs_buf_pg_order;
-extern int pebs_epoch_usecs;
 extern void *pebs_sample_buf;
 
 int pebs_tracking_start(void);
