@@ -1035,11 +1035,11 @@ static int move_to_new_folio(struct folio *dst, struct folio *src,
 	if (likely(is_lru)) {
 		struct address_space *mapping = folio_mapping(src);
 
-		if (!mapping)
+		if (!mapping) {
 			rc = migrate_folio(mapping, dst, src, mode);
-		else if (mapping_inaccessible(mapping))
+		} else if (mapping_inaccessible(mapping)) {
 			rc = -EOPNOTSUPP;
-		else if (mapping->a_ops->migrate_folio)
+		} else if (mapping->a_ops->migrate_folio) {
 			/*
 			 * Most folios have a mapping and most filesystems
 			 * provide a migrate_folio callback. Anonymous folios
@@ -1049,8 +1049,9 @@ static int move_to_new_folio(struct folio *dst, struct folio *src,
 			 */
 			rc = mapping->a_ops->migrate_folio(mapping, dst, src,
 								mode);
-		else
+		} else {
 			rc = fallback_migrate_folio(mapping, dst, src, mode);
+		}
 	} else {
 		const struct movable_operations *mops;
 

@@ -16,6 +16,7 @@
 #include <linux/vmalloc.h>
 
 int epoch_usecs = 1E6; /* 1 second by default */
+int dirty_latency_threshold_usecs = 1E6; /* 1s by default */
 
 static const char *tiering_mode_str[] = {
 	[TIERING_MODE_OFF] = "off",
@@ -37,6 +38,31 @@ static const char *pebs_hottrack_state_str[] = {
 };
 
 #endif
+
+static ssize_t dirty_latency_threshold_msecs_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", dirty_latency_threshold_usecs / 1000);
+}
+
+static ssize_t dirty_latency_threshold_msecs_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int err, msecs;
+
+	err = kstrtoint(buf, 0, &msecs);
+	if (err)
+		return err;
+
+	if (msecs < 1 || msecs > 60000) /* 60 seconds max */
+		return -EINVAL;
+
+	dirty_latency_threshold_usecs = msecs * 1000;
+	return count;
+}
+
+static struct kobj_attribute dirty_latency_threshold_msecs_attr =
+		__ATTR_RW(dirty_latency_threshold_msecs);
 
 static ssize_t tiering_mode_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
@@ -116,13 +142,13 @@ static ssize_t epoch_usecs_store(struct kobject *kobj,
 static struct kobj_attribute epoch_usecs_attr =
 	__ATTR_RW(epoch_usecs);
 
-static ssize_t prom_mbps_show(struct kobject *kobj,
+static ssize_t promote_mb_epoch_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%d\n", (promote_pg_sec) / 256);
+	return sysfs_emit(buf, "%d\n", (promote_pg_epoch) / 256);
 }
 
-static ssize_t prom_mbps_store(struct kobject *kobj,
+static ssize_t promote_mb_epoch_store(struct kobject *kobj,
 		struct kobj_attribute *attr, const char *buf, size_t count)
 {
 	int err, mbps;
@@ -131,11 +157,11 @@ static ssize_t prom_mbps_store(struct kobject *kobj,
 	if (err)
 		return err;
 
-	WRITE_ONCE(promote_pg_sec, mbps * 256);
+	WRITE_ONCE(promote_pg_epoch, mbps * 256);
 	return count;
 }
 
-static struct kobj_attribute prom_mbps_attr = __ATTR_RW(prom_mbps);
+static struct kobj_attribute promote_mb_epoch_attr = __ATTR_RW(promote_mb_epoch);
 
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
 
@@ -292,7 +318,8 @@ static struct kobj_attribute pebs_buf_pg_order_attr =
 #endif /* CONFIG_CONGESTIER_PGTEMP_PEBS */
 
 static struct attribute *congestier_sysfs_attrs[] = {
-	&prom_mbps_attr.attr,
+	&promote_mb_epoch_attr.attr,
+	&dirty_latency_threshold_msecs_attr.attr,
 	&tiering_mode_attr.attr,
 	&epoch_usecs_attr.attr,
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
