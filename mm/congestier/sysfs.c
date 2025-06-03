@@ -21,10 +21,17 @@ int tier_frame_pg_order = 3;
 
 static const char *tiering_mode_str[] = {
 	[TIERING_MODE_OFF] = "off",
-	[TIERING_MODE_ON] = "on",
+	[TIERING_MODE_ON] = "on"
+};
+
+static const char *tiering_interleave_modestr[] = {
+	[TIM_HALF] = "half",
+	[TIM_GSTEP] = "agestep",
+	[TIM_HSTEP] = "hotstep"
 };
 
 enum tiering_mode tiering_mode = TIERING_MODE_OFF;
+enum tiering_interleave_mode tiering_interleave_mode = TIM_HALF;
 
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
 
@@ -39,6 +46,32 @@ static const char *pebs_hottrack_state_str[] = {
 };
 
 #endif
+
+static ssize_t tiering_interleave_mode_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	enum tiering_interleave_mode mode = READ_ONCE(tiering_interleave_mode);
+	int len = strlen(tiering_interleave_modestr[mode]);
+	sysfs_emit(buf, "%s", tiering_interleave_modestr[mode]);
+	return len;
+}
+
+static ssize_t tiering_interleave_mode_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	for (int i = 0; i < NR_TIERING_INTERLEAVE_MODES; i++) {
+		if (sysfs_streq(buf, tiering_interleave_modestr[i])) {
+			tiering_interleave_mode = i;
+			return count;
+		}
+	}
+
+	printk(KERN_ERR "Invalid tiering interleave mode: %s\n", buf);
+	return -EINVAL;
+}
+
+static struct kobj_attribute tiering_interleave_mode_attr =
+	__ATTR_RW(tiering_interleave_mode);
 
 static ssize_t tier_frame_pg_order_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
@@ -351,6 +384,7 @@ static struct attribute *congestier_sysfs_attrs[] = {
 	&tiering_mode_attr.attr,
 	&epoch_usecs_attr.attr,
 	&tier_frame_pg_order_attr.attr,
+	&tiering_interleave_mode_attr.attr,
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
 	&pebs_buf_pg_order_attr.attr,
 	&pgtemp_granularity_order_attr.attr,

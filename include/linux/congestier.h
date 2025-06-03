@@ -34,11 +34,17 @@ enum tiering_mode {
 	NR_TIERING_MODES,
 };
 
+enum tiering_interleave_mode {
+	TIM_HALF,
+	TIM_GSTEP,
+	TIM_HSTEP,
+	NR_TIERING_INTERLEAVE_MODES,
+};
+
 enum blk_tiering_state {
 	NOT_TIERED,
 	TIERING_CANDIDATE,
-	TIERED_DEMOTED,
-	TIERED_PROMOTED,
+	TIERED,
 	NR_TIER_STATES,
 };
 
@@ -52,7 +58,7 @@ struct pg_temp_block {
 	struct list_head temper_class;
 
 	/* for use in tiering */
-	int nr_dram_pgs, nr_cxl_pgs;
+	int demotion_level;
 	enum blk_tiering_state tiering_state;
 	uint64_t tiering_epoch;
 };
@@ -66,6 +72,7 @@ struct temperature_class {
 extern int promote_pg_epoch;
 extern int epoch_usecs;
 extern enum tiering_mode tiering_mode;
+extern enum tiering_interleave_mode tiering_interleave_mode;
 
 int tiering_start(void);
 int tiering_stop(void);
@@ -81,6 +88,7 @@ enum pg_temp_pebs_state {
 extern int dirty_latency_threshold_usecs;
 extern int pgtemp_granularity_order;
 extern int pebs_buf_pg_order;
+extern int tier_frame_pg_order;
 extern void *pebs_sample_buf;
 
 int pebs_tracking_start(void);

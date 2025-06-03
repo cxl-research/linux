@@ -180,10 +180,11 @@ int pebs_track_epoch_work(int epoch_id)
 	struct pg_temp_block *blk;
 	uint64_t head, tail, offset;
 	uint64_t blocknum, period, epspassed, temper;
-	int pid, blockshift, targetidx, err, oldcls, newcls;
+	int pid, blockshift, targetidx, err, oldcls, newcls, tier_frame_pages;
 	int newblks = 0, minor_update_blks = 0, major_update_blks = 0;
 
 	blockshift = PAGE_SHIFT + pgtemp_granularity_order;
+	tier_frame_pages = 1 << tier_frame_pg_order;
 	head = READ_ONCE(hdr->head);
 	tail = max(READ_ONCE(hdr->tail), READ_ONCE(hdr->tail_start));
 
@@ -220,9 +221,12 @@ int pebs_track_epoch_work(int epoch_id)
 			blk->pid = pid;
 			INIT_LIST_HEAD(&(blk->temper_class));
 
-			/* (0,0) means they have not yet ever been considered for tiering */
-			blk->nr_dram_pgs = 0;
-			blk->nr_cxl_pgs = 0;
+			/* Demotion level is 0, as we assume all allocations to be 
+			 * from DRAM initially.
+			 * TODO: Detect VMA mempolicy and set this accordingly.			
+			 */
+			blk->demotion_level = 0;
+
 			blk->tiering_state = NOT_TIERED;
 			blk->tiering_epoch = epoch_id;
 
@@ -242,7 +246,8 @@ int pebs_track_epoch_work(int epoch_id)
 			tmpcls[NEW_BLK_CLS].nr_blocks++;
 			mutex_unlock(&tmpcls[NEW_BLK_CLS].templock);
 		} else if (blk->last_updated_epoch == epoch_id) {
-			blk->period_sum_this_epoch_ld += period;
+			blk->period_sum_this_epoch_ld += (period * tier_frame_pages) / \
+															(tier_frame_pages - blk->demotion_level);
 			blk->nr_samples_this_epoch_ld++;
 			++minor_update_blks;
 		} else {
@@ -256,7 +261,8 @@ int pebs_track_epoch_work(int epoch_id)
 				blk->ld_temp = (temper >> epspassed);
 
 			newcls = temp_class(blk->ld_temp);
-			blk->period_sum_this_epoch_ld = period;
+			blk->period_sum_this_epoch_ld = (period * tier_frame_pages) / \
+														(tier_frame_pages - blk->demotion_level);
 			blk->nr_samples_this_epoch_ld = 1;
 			blk->last_updated_epoch = epoch_id;
 			++major_update_blks;
