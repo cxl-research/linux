@@ -26,7 +26,7 @@ struct tiering_ctx {
 int promote_pg_epoch = 0;
 
 static int epochid = 0;
-static int tiering_reset_secs = 30;
+static int tiering_reset_epochs = 10;
 
 static inline int ptep_test_and_clear_dirty(struct mm_struct *mm,
 		unsigned long addr, pte_t *ptep)
@@ -195,8 +195,7 @@ static unsigned int congestier_promote_pages(struct list_head *folios)
 	unsigned int nr_migrated = 0;
 	nodemask_t allowed_mask = NODE_MASK_NONE;
 	struct migration_target_control mtc = {
-		.gfp_mask = (GFP_HIGHUSER_MOVABLE & ~__GFP_RECLAIM) |
-						__GFP_NOWARN | __GFP_NOMEMALLOC | GFP_NOWAIT,
+		.gfp_mask = GFP_HIGHUSER_MOVABLE,
 		.nid = 1, /* DRAM NID */
 		.nmask = &allowed_mask
 	};
@@ -386,7 +385,8 @@ static int do_tiering(void)
 
 		nr_migratable += tierinfo.nr_migratable;
 		nr_tried += tierinfo.nr_candidates;
-		blk->tiering_state = TIERED;
+		blk->tiering_state = tierinfo.tier_promote ? \
+					TIERED_PROMOTED : TIERED_DEMOTED;
 	}
 
 	printk(KERN_INFO "do_tiering: %u/%u migratable\n",
@@ -411,31 +411,92 @@ static int do_tiering(void)
 	return nr_migrated;
 }
 
-static void find_tiering_candidates(void)
+static int mk_candidate_blk(struct pg_temp_block *blk,
+														int epochid)
 {
-	struct pg_temp_block *blk, *n;
-	struct temperature_class *cls;
 	struct task_struct *task;
 	struct mm_struct *mm;
+	struct tiering_candidate *candidate;
 	struct tiering_pgwalk_private tierinfo = {
 		.nr_candidates = 0, .nr_migratable = 0,
 		.tiering_candidate = NULL,
 		.tier_promote = (promote_pg_epoch > 0),
 		.update_blk = false, .folio_list = NULL,
 	};
-	struct tiering_candidate *candidate;
 	uint64_t addr_start, addr_end;
-	int num_pages, blkshift, dlt_epochs, nr_candidates = 0;
+	int blkshift, dlt_epochs, num_pages, nr_candidates = 0;
 	pid_t pid;
 
+	blkshift = PAGE_SHIFT + pgtemp_granularity_order;
 	dlt_epochs = dirty_latency_threshold_usecs / epoch_usecs;
+	num_pages = READ_ONCE(promote_pg_epoch);
+	if (!num_pages)
+		return 0;
+	if (num_pages < 0)
+		num_pages *= -1;
+
+	if (blk->tiering_state == NOT_TIERED) {
+		blk->tiering_state = TIERING_CANDIDATE;
+		blk->tiering_epoch = epochid + dlt_epochs;
+
+		if (blk->nr_dram_pgs + blk->nr_cxl_pgs == 0)
+			tierinfo.update_blk = true;
+
+		pid = blk->pid;
+		addr_start = blk->blocknum << blkshift;
+		addr_end = addr_start + min((num_pages << PAGE_SHIFT),
+					(1 << (pgtemp_granularity_order + PAGE_SHIFT)));
+
+		task = find_task_by_vpid(pid);
+		if (!task)
+			return -ENOENT;
+
+		mm = get_task_mm(task);
+		if (!mm)
+			return -ENOMEM;
+
+		candidate = kmalloc(sizeof(struct tiering_candidate), GFP_KERNEL);
+		candidate->blk = blk;
+		if (tierinfo.tier_promote)
+			list_add(&candidate->siblings, &__tierctx.cxl_cands);
+		else
+			list_add(&candidate->siblings, &__tierctx.dram_cands);
+		tierinfo.tiering_candidate = candidate;
+		tierinfo.nr_candidates = 0;
+
+		mmap_read_lock(mm);
+		walk_page_range(mm, addr_start, addr_end,
+				&tiering_mk_candidate_ops, &tierinfo);
+		mmap_read_unlock(mm);
+		mmput(mm);
+
+		nr_candidates = tierinfo.nr_candidates;
+	} else if (blk->tiering_state > TIERING_CANDIDATE) {
+		if ((tierinfo.tier_promote && blk->tiering_state == TIERED_DEMOTED) ||
+		    (!tierinfo.tier_promote && blk->tiering_state == TIERED_PROMOTED)) {
+			/* if reset time has passed, mk available next epoch */
+			if (blk->tiering_epoch + tiering_reset_epochs <= epochid) {
+				blk->tiering_state = NOT_TIERED;
+				blk->nr_dram_pgs = 0;
+				blk->nr_cxl_pgs = 0;
+			}
+		}
+	}
+	return nr_candidates;
+}
+
+static void find_tiering_candidates(void)
+{
+	struct pg_temp_block *blk, *n;
+	struct temperature_class *cls;
+	int num_pages, nr_candidates = 0;
+
 	num_pages = READ_ONCE(promote_pg_epoch);
 	if (!num_pages)
 		return;
 	if (num_pages < 0)
 		num_pages *= -1;
 
-	blkshift = PAGE_SHIFT + pgtemp_granularity_order;
 	for (int idx = NR_TEMPERATURE_CLASSES - 1; idx >= 0; --idx) {
 		cls = get_temp_cls(idx);
 		if (!cls || !cls->nr_blocks)
@@ -443,48 +504,10 @@ static void find_tiering_candidates(void)
 
 		mutex_lock(&cls->templock);
 		list_for_each_entry_safe(blk, n, &cls->blocks, temper_class) {
-			if (blk->tiering_state == NOT_TIERED) {
-				blk->tiering_state = TIERING_CANDIDATE;
-				blk->tiering_epoch = epochid + dlt_epochs;
-				pid = blk->pid;
-				addr_start = blk->blocknum << blkshift;
-				addr_end = addr_start + min((num_pages << PAGE_SHIFT),
-							(1 << (pgtemp_granularity_order + PAGE_SHIFT)));
-
-				task = find_task_by_vpid(pid);
-				if (!task)
-					continue;
-
-				mm = get_task_mm(task);
-
-				// add a new tiering candidate
-				candidate = kmalloc(sizeof(struct tiering_candidate), GFP_KERNEL);
-				candidate->blk = blk;
-
-				if (tierinfo.tier_promote)
-					list_add(&candidate->siblings, &__tierctx.cxl_cands);
-				else
-					list_add(&candidate->siblings, &__tierctx.dram_cands);
-
-				tierinfo.tiering_candidate = candidate;
-				if (blk->nr_dram_pgs + blk->nr_cxl_pgs == 0)
-					tierinfo.update_blk = true;
-				tierinfo.nr_candidates = 0;
-
-				mmap_read_lock(mm);
-				walk_page_range(mm, addr_start, addr_end,
-						&tiering_mk_candidate_ops, &tierinfo);
-				mmap_read_unlock(mm);
-				mmput(mm);
-
-				num_pages -= tierinfo.nr_candidates;
-				nr_candidates += tierinfo.nr_candidates;
-
-				if (num_pages <= 0)
-					goto out;
-			}
+			nr_candidates += mk_candidate_blk(blk, epochid);
+			if (nr_candidates >= num_pages)
+				break;
 		}
-out:
 		mutex_unlock(&cls->templock);
 	}
 

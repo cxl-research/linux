@@ -37,7 +37,8 @@ enum tiering_mode {
 enum blk_tiering_state {
 	NOT_TIERED,
 	TIERING_CANDIDATE,
-	TIERED,
+	TIERED_DEMOTED,
+	TIERED_PROMOTED,
 	NR_TIER_STATES,
 };
 

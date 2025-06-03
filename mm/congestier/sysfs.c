@@ -17,6 +17,7 @@
 
 int epoch_usecs = 1E6; /* 1 second by default */
 int dirty_latency_threshold_usecs = 1E6; /* 1s by default */
+int tier_frame_pg_order = 3;
 
 static const char *tiering_mode_str[] = {
 	[TIERING_MODE_OFF] = "off",
@@ -38,6 +39,33 @@ static const char *pebs_hottrack_state_str[] = {
 };
 
 #endif
+
+static ssize_t tier_frame_pg_order_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	int order = READ_ONCE(tier_frame_pg_order);
+	return sysfs_emit(buf, "%d\n", order);
+}
+
+static ssize_t tier_frame_pg_order_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int err, neworder;
+
+	err = kstrtoint(buf, 0, &neworder);
+	if (err)
+		return err;
+
+	if (neworder < 0 || neworder > 9)
+		return -EINVAL;
+
+	WRITE_ONCE(tier_frame_pg_order, neworder);
+
+	return count;
+}
+
+static struct kobj_attribute tier_frame_pg_order_attr =
+	__ATTR_RW(tier_frame_pg_order);
 
 static ssize_t dirty_latency_threshold_msecs_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
@@ -322,6 +350,7 @@ static struct attribute *congestier_sysfs_attrs[] = {
 	&dirty_latency_threshold_msecs_attr.attr,
 	&tiering_mode_attr.attr,
 	&epoch_usecs_attr.attr,
+	&tier_frame_pg_order_attr.attr,
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
 	&pebs_buf_pg_order_attr.attr,
 	&pgtemp_granularity_order_attr.attr,
