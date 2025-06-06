@@ -34,6 +34,7 @@ struct pebs_track_ctx {
 } __tempctx;
 
 static struct pg_temp_target targets[MAX_PGTEMP_TARGETS];
+static pid_t recently_reclaimed_pids[MAX_PGTEMP_TARGETS];
 static int nr_targets = 0;
 
 static struct temperature_class tmpcls[NR_TEMPERATURE_CLASSES + 1];
@@ -59,6 +60,16 @@ static inline int temp_class(uint64_t temp)
 	return i;
 }
 
+static inline bool reclaimed_recently(pid_t pid)
+{
+	for (int i = 0; i < MAX_PGTEMP_TARGETS; ++i) {
+		if (recently_reclaimed_pids[i] == pid) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static inline int target_idx_from_pid(pid_t pid)
 {
 	for (int i = 0; i < nr_targets; ++i) {
@@ -70,14 +81,61 @@ static inline int target_idx_from_pid(pid_t pid)
 
 static inline int new_target_idx(pid_t pid, int epoch_id)
 {
+	int idx = 0;
+
 	if (nr_targets >= MAX_PGTEMP_TARGETS)
 		return -ENOMEM;
 
-	targets[nr_targets].pid = pid;
-	targets[nr_targets].nr_blocks = 0;
-	xa_init_flags(&(targets[nr_targets].blocks), XA_FLAGS_LOCK_BH);
+	/* find first idx where pid is 0 */
+	while(idx < nr_targets && targets[idx].pid != 0)
+		idx++;
+	targets[idx].pid = pid;
+	targets[idx].nr_blocks = 0;
+	xa_init_flags(&(targets[idx].blocks), XA_FLAGS_LOCK_BH);
+	nr_targets++;
+	printk(KERN_INFO "New target: pid=%d idx=%d nr=%d\n",
+			pid, idx, nr_targets);
 
-	return nr_targets++;
+	return idx;
+}
+
+static void reclaim_dead_targets(void)
+{
+	struct task_struct *task;
+	struct pg_temp_block *blk;
+	struct temperature_class *cls;
+	unsigned long index;
+	pid_t pid;
+	int nfreed = 0, tmpcls;
+
+	for (int i = 0; i < nr_targets; ++i) {
+		pid = targets[i].pid;
+		if (pid == 0)
+			continue; /* not initialized */
+
+		task = find_task_by_vpid(pid);
+		if (!task || !pid_alive(task)) {
+			xa_for_each(&targets[i].blocks, index, blk) {
+				tmpcls = temp_class(blk->ld_temp);
+				cls = get_temp_cls(tmpcls);
+				list_del(&blk->temper_class);
+				cls->nr_blocks--;
+				kfree(blk);
+				nfreed++;
+			}
+
+			xa_destroy(&targets[i].blocks);
+			targets[i].nr_blocks = 0;
+			targets[i].pid = 0; /* mark as dead */
+			nr_targets--;
+
+			/* Add to recently reclaimed pids */
+			recently_reclaimed_pids[i] = pid;
+
+			printk(KERN_INFO  "Reclaimed %d: pid=%d idx=%d nr=%d\n",
+					nfreed, pid, i, nr_targets);
+		}
+	}
 }
 
 static void debug_print_temperature_classes(void)
@@ -110,6 +168,13 @@ static void scrub_temperature_class(int clsidx, int epoch_id)
 	mutex_lock(&cls->templock);
 	list_for_each_safe(pos, n, &cls->blocks) {
 		blk = list_entry(pos, struct pg_temp_block, temper_class);
+		if (reclaimed_recently(blk->pid)) {
+			list_del(pos);
+			cls->nr_blocks--;
+			kfree(blk);
+			continue;
+		}
+
 		epochs_passed = epoch_id - blk->last_updated_epoch;
 		blk->ld_temp += blk->period_sum_this_epoch_ld;
 
@@ -141,7 +206,6 @@ static void free_temperature_class(int clsidx, int epoch_id)
 	struct pg_temp_block *blk;
 	struct temperature_class *cls = &tmpcls[clsidx];
 	struct list_head *pos, *n;
-	int targetidx;
 
 	scrub_temperature_class(clsidx, epoch_id);
 	if (cls->nr_blocks == 0)
@@ -152,9 +216,6 @@ static void free_temperature_class(int clsidx, int epoch_id)
 		blk = list_entry(pos, struct pg_temp_block, temper_class);
 		list_del(pos);
 		cls->nr_blocks--;
-		targetidx = target_idx_from_pid(blk->pid);
-		xa_erase(&(targets[targetidx].blocks), blk->blocknum);
-		kfree(blk);
 	}
 	mutex_unlock(&cls->templock);
 	cls->nr_blocks = 0;
@@ -199,6 +260,9 @@ int pebs_track_epoch_work(int epoch_id)
 		blocknum = smp->addr >> blockshift;
 		pid = smp->pid;
 		period = smp->period;
+
+		if (reclaimed_recently(pid))
+			goto skip_this_sample;
 
 		targetidx = target_idx_from_pid(pid);
 		if (targetidx < 0) {
@@ -287,12 +351,29 @@ skip_this_sample:
 	WRITE_ONCE(hdr->tail, tail);
 	for (int tc = NR_TEMPERATURE_CLASSES; tc >= 0; --tc)
 		scrub_temperature_class(tc, epoch_id);
+	reclaim_dead_targets();
 	debug_print_temperature_classes();
 	printk(KERN_INFO "PEBS epoch %d: (%llu %llu) (%d,%d,%d)\n", 
 				epoch_id, head, tail, newblks,
 				minor_update_blks, major_update_blks);
 
 	return 0;
+}
+
+void reset_pebs_tracking(void)
+{
+	nr_targets = 0;
+
+	/* Free all temperature classes */
+	for (int i = 0; i <= NR_TEMPERATURE_CLASSES; ++i) {
+		free_temperature_class(i, 0);
+	}
+
+	for (int i = 0; i < nr_targets; ++i) {
+		xa_destroy(&targets[i].blocks);
+		targets[i].nr_blocks = 0;
+		targets[i].pid = 0;
+	}
 }
 
 #endif /* CONFIG_CONGESTIER_PGTEMP_PEBS */

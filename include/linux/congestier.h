@@ -69,13 +69,18 @@ struct temperature_class {
 	int nr_blocks, tmp_cls_idx;
 };
 
-extern int promote_pg_epoch;
-extern int epoch_usecs;
-extern enum tiering_mode tiering_mode;
+extern int sysctl_promote_pg_epoch;
+extern int sysctl_epoch_usecs;
+extern int sysctl_dirty_latency_threshold_usecs;
+extern int sysctl_tiering_epoch_usecs;
+extern enum tiering_mode sysctl_tiering_mode;
+
+extern int tier_frame_pg_order;
 extern enum tiering_interleave_mode tiering_interleave_mode;
 
 int tiering_start(void);
 int tiering_stop(void);
+void reset_tiering_ctx(void);
 
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
 
@@ -85,10 +90,8 @@ enum pg_temp_pebs_state {
 	NR_TRACK_STATES,
 };
 
-extern int dirty_latency_threshold_usecs;
 extern int pgtemp_granularity_order;
 extern int pebs_buf_pg_order;
-extern int tier_frame_pg_order;
 extern void *pebs_sample_buf;
 
 int pebs_tracking_start(void);
@@ -96,5 +99,6 @@ int pebs_tracking_stop(void);
 int pebs_track_epoch_work(int epoch_id);
 void pebs_track_init(void);
 struct temperature_class *get_temp_cls(int idx);
+void reset_pebs_tracking(void);
 
 #endif /* CONFIG_CONGESTIER_PGTEMP_PEBS */

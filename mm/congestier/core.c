@@ -23,10 +23,18 @@ struct tiering_ctx {
 	struct list_head cxl_cands;
 } __tierctx;
 
-int promote_pg_epoch = 0;
+int tier_frame_pg_order = 3; /* 8-page frames by default  */
+enum tiering_interleave_mode tiering_interleave_mode = TIM_HALF;
+
+static int promote_pg_epoch = 0;
+static int epoch_usecs = 1E5; /* 100ms by default */
+static int tiering_epoch_usecs = 1E6; /* 1 second by default */
+static int dirty_latency_threshold_usecs = 2E5; /* 200ms by default */
+static enum tiering_mode tiering_mode = TIERING_MODE_OFF;
+static int tiering_reset_epochs = 10;
 
 static int epochid = 0;
-static int tiering_reset_epochs = 10;
+static int next_tiering_epoch = 0;
 
 static inline int ptep_test_and_clear_dirty(struct mm_struct *mm,
 		unsigned long addr, pte_t *ptep)
@@ -348,6 +356,7 @@ static int do_tiering_ptep(pte_t *ptep, unsigned long addr,
 	struct tiering_pgwalk_private *priv = walk->private;
 	struct page *page;
 	struct folio *folio;
+	pte_t pte = ptep_get(ptep);
 	int nid, tier_frame_offset, tier_frame_pages;
 
 	tier_frame_pages = 1 << tier_frame_pg_order;
@@ -366,10 +375,10 @@ static int do_tiering_ptep(pte_t *ptep, unsigned long addr,
 		}
 	}
 
-	if (pte_none(*ptep) || !pte_present(*ptep))
+	if (pte_none(pte) || !pte_present(pte))
 		goto out;
 
-	page = pte_page(*ptep);
+	page = pte_page(pte);
 	if (!page || PageTail(page))
 		goto out;
 
@@ -381,7 +390,7 @@ static int do_tiering_ptep(pte_t *ptep, unsigned long addr,
 	}
 
 	priv->nr_candidates++;
-	if (!pte_dirty(*ptep)) {
+	if (!pte_dirty(pte)) {
 		/* If the page is not dirty, add it to folio_list */
 		folio = page_folio(page);
 		if (!folio_test_lru(folio) || !folio_try_get(folio))
@@ -460,6 +469,7 @@ static int do_tiering(void)
 			continue;
 
 		list_del(&pos->siblings);
+		kfree(pos);
 
 		pid = blk->pid;
 		task = find_task_by_vpid(pid);
@@ -614,6 +624,15 @@ static void find_tiering_candidates(void)
 				epochid, nr_candidates);
 }
 
+static void __commit_sysctl_vals(void)
+{
+	tiering_mode = READ_ONCE(sysctl_tiering_mode);
+	promote_pg_epoch = READ_ONCE(sysctl_promote_pg_epoch);
+	epoch_usecs = READ_ONCE(sysctl_epoch_usecs);
+	tiering_epoch_usecs = READ_ONCE(sysctl_tiering_epoch_usecs);
+	dirty_latency_threshold_usecs = READ_ONCE(sysctl_dirty_latency_threshold_usecs);
+}
+
 static int tiering_fn(void *data)
 {
 	uint64_t start, end, dur_usecs;
@@ -626,12 +645,17 @@ static int tiering_fn(void *data)
 	while (!tiering_need_stop()) {
 		start = ktime_get_ns();
 
+		__commit_sysctl_vals();
+
 		pgtemp_track_epoch_work(epochid);
 
 		if (READ_ONCE(tiering_mode) == TIERING_MODE_OFF)
 			goto end_epoch;
 
-		find_tiering_candidates();
+		if (epochid >= next_tiering_epoch) {
+			next_tiering_epoch = epochid + (tiering_epoch_usecs / epoch_usecs);
+			find_tiering_candidates();
+		}
 		migrated = do_tiering();
 
 end_epoch:
@@ -652,6 +676,20 @@ end_epoch:
 		}
 	}
 
-	/* TODO: FREE CANDIDATE FOLIOS */
 	return 0;
+}
+
+void reset_tiering_ctx(void)
+{
+	struct tiering_candidate *pos, *n;
+	epochid = 0;
+	next_tiering_epoch = 0;
+	list_for_each_entry_safe(pos, n, &__tierctx.dram_cands, siblings) {
+		list_del(&pos->siblings);
+		kfree(pos);
+	}
+	list_for_each_entry_safe(pos, n, &__tierctx.cxl_cands, siblings) {
+		list_del(&pos->siblings);
+		kfree(pos);
+	}
 }

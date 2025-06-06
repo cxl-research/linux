@@ -15,9 +15,11 @@
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 
-int epoch_usecs = 1E6; /* 1 second by default */
-int dirty_latency_threshold_usecs = 1E6; /* 1s by default */
-int tier_frame_pg_order = 3;
+int sysctl_promote_pg_epoch = 0;
+int sysctl_epoch_usecs = 1E6; /* 1 second by default */
+int sysctl_dirty_latency_threshold_usecs = 0; /* 0 by default */
+int sysctl_tiering_epoch_usecs = 1E6; /* 1 second by default */
+enum tiering_mode sysctl_tiering_mode = TIERING_MODE_OFF;
 
 static const char *tiering_mode_str[] = {
 	[TIERING_MODE_OFF] = "off",
@@ -29,9 +31,6 @@ static const char *tiering_interleave_modestr[] = {
 	[TIM_GSTEP] = "agestep",
 	[TIM_HSTEP] = "hotstep"
 };
-
-enum tiering_mode tiering_mode = TIERING_MODE_OFF;
-enum tiering_interleave_mode tiering_interleave_mode = TIM_HALF;
 
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
 
@@ -46,6 +45,31 @@ static const char *pebs_hottrack_state_str[] = {
 };
 
 #endif
+
+static ssize_t tiering_epoch_msecs_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", sysctl_tiering_epoch_usecs / 1000);
+}
+
+static ssize_t tiering_epoch_msecs_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int err, msecs;
+
+	err = kstrtoint(buf, 0, &msecs);
+	if (err)
+		return err;
+
+	if (msecs < 1 || msecs > 5000) /* 5 seconds max */
+		return -EINVAL;
+
+	sysctl_tiering_epoch_usecs = msecs * 1000;
+	return count;
+}
+
+static struct kobj_attribute tiering_epoch_msecs_attr =
+		__ATTR_RW(tiering_epoch_msecs);
 
 static ssize_t tiering_interleave_mode_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
@@ -103,7 +127,7 @@ static struct kobj_attribute tier_frame_pg_order_attr =
 static ssize_t dirty_latency_threshold_msecs_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%d\n", dirty_latency_threshold_usecs / 1000);
+	return sysfs_emit(buf, "%d\n", sysctl_dirty_latency_threshold_usecs / 1000);
 }
 
 static ssize_t dirty_latency_threshold_msecs_store(struct kobject *kobj,
@@ -115,10 +139,10 @@ static ssize_t dirty_latency_threshold_msecs_store(struct kobject *kobj,
 	if (err)
 		return err;
 
-	if (msecs < 1 || msecs > 60000) /* 60 seconds max */
+	if (msecs < 0 || msecs > 60000) /* 60 seconds max */
 		return -EINVAL;
 
-	dirty_latency_threshold_usecs = msecs * 1000;
+	sysctl_dirty_latency_threshold_usecs = msecs * 1000;
 	return count;
 }
 
@@ -128,7 +152,7 @@ static struct kobj_attribute dirty_latency_threshold_msecs_attr =
 static ssize_t tiering_mode_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
-	enum tiering_mode mode = READ_ONCE(tiering_mode);
+	enum tiering_mode mode = READ_ONCE(sysctl_tiering_mode);
 	int len = strlen(tiering_mode_str[mode]);
 	sysfs_emit(buf, "%s", tiering_mode_str[mode]);
 	return len;
@@ -140,7 +164,7 @@ static ssize_t tiering_mode_store(struct kobject *kobj,
 	int err;
 	enum tiering_mode oldmode, newmode;
 
-	oldmode = READ_ONCE(tiering_mode);
+	oldmode = READ_ONCE(sysctl_tiering_mode);
 
 	if (!strncmp(buf, "off", 3)) {
 		newmode = TIERING_MODE_OFF;
@@ -150,7 +174,7 @@ static ssize_t tiering_mode_store(struct kobject *kobj,
 
 		if ((err = tiering_stop()))
 			return err;
-		WRITE_ONCE(tiering_mode, newmode);
+		WRITE_ONCE(sysctl_tiering_mode, newmode);
 	} else if (!strncmp(buf, "on", 2)) {
 		newmode = TIERING_MODE_ON;
 
@@ -166,7 +190,13 @@ static ssize_t tiering_mode_store(struct kobject *kobj,
 #endif
 		if ((err = tiering_start()))
 			return err;
-		WRITE_ONCE(tiering_mode, newmode);
+		WRITE_ONCE(sysctl_tiering_mode, newmode);
+	} else if (!strncmp(buf, "reset", 5)) {
+		if (oldmode == TIERING_MODE_ON) {
+			printk(KERN_ERR "Turn tiering_mode OFF before resetting.\n");
+			return -EPERM;
+		}
+		reset_tiering_ctx();
 	} else {
 		return -EINVAL;
 	}
@@ -180,7 +210,7 @@ static struct kobj_attribute tiering_mode_attr =
 static ssize_t epoch_usecs_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
-	int usecs = READ_ONCE(epoch_usecs);
+	int usecs = READ_ONCE(sysctl_epoch_usecs);
 	return sysfs_emit(buf, "%d\n", usecs);
 }
 
@@ -196,7 +226,7 @@ static ssize_t epoch_usecs_store(struct kobject *kobj,
 	if (usecs < 1000 || usecs > 1E8)
 		return -EINVAL;
 
-	WRITE_ONCE(epoch_usecs, usecs);
+	WRITE_ONCE(sysctl_epoch_usecs, usecs);
 	return count;
 }
 
@@ -206,7 +236,7 @@ static struct kobj_attribute epoch_usecs_attr =
 static ssize_t promote_mb_epoch_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%d\n", (promote_pg_epoch) / 256);
+	return sysfs_emit(buf, "%d\n", (sysctl_promote_pg_epoch) / 256);
 }
 
 static ssize_t promote_mb_epoch_store(struct kobject *kobj,
@@ -218,7 +248,7 @@ static ssize_t promote_mb_epoch_store(struct kobject *kobj,
 	if (err)
 		return err;
 
-	WRITE_ONCE(promote_pg_epoch, mbps * 256);
+	WRITE_ONCE(sysctl_promote_pg_epoch, mbps * 256);
 	return count;
 }
 
@@ -299,6 +329,12 @@ static ssize_t pebs_hottrack_state_store(struct kobject *kobj,
 		WRITE_ONCE(pebs_hottrack_state, newstate);
 		if((err = pebs_tracking_start()))
 			return err;
+	} else if (!strncmp(buf, "reset", 5)) {
+		if (oldstate == TRACK_HOTNESS_ON) {
+			printk(KERN_ERR "Turn pebs_hottrack_state OFF before resetting.\n");
+			return -EPERM;
+		}
+		reset_pebs_tracking();
 	} else {
 		return -EINVAL;
 	}
@@ -385,6 +421,7 @@ static struct attribute *congestier_sysfs_attrs[] = {
 	&epoch_usecs_attr.attr,
 	&tier_frame_pg_order_attr.attr,
 	&tiering_interleave_mode_attr.attr,
+	&tiering_epoch_msecs_attr.attr,
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
 	&pebs_buf_pg_order_attr.attr,
 	&pgtemp_granularity_order_attr.attr,
