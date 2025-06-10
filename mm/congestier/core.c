@@ -277,9 +277,6 @@ static unsigned int congestier_promote_pages(struct list_head *folios)
 	ret = congestier_migrate_pages(folios, alloc_migrate_folio, NULL,
 		      (unsigned long)&mtc, MIGRATE_ASYNC, MR_CONGESTIER,
 		      &nr_migrated);
-
-	printk(KERN_INFO "promote: ret %d migrated %u\n", ret, nr_migrated);
-
 	return nr_migrated;
 }
 
@@ -327,10 +324,6 @@ static unsigned int congestier_demote_pages(struct list_head *folios)
 	ret3 = congestier_migrate_pages(&fol3, alloc_migrate_folio, NULL,
 															(unsigned long)&mtc3, MIGRATE_ASYNC,
 															MR_CONGESTIER, &nr_migr_3);
-
-	printk(KERN_INFO "demote: ret %d %d migr %u %u\n",
-							ret2, ret3, nr_migr_2, nr_migr_3);
-
 	return (nr_migr_2 + nr_migr_3);
 }
 

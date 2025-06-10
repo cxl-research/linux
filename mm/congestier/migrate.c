@@ -94,7 +94,7 @@ static bool rwc_remap_pte(struct folio *folio,
 
 static int copy_and_remap_folio(struct folio *src, struct folio *dst)
 {
-	int rc = MIGRATEPAGE_SUCCESS;
+	int rc = -ENOMEM;
 	unsigned long srcflags;
 	struct address_space *mapping;
 	struct rmap_walk_control rwc_mkclean = {
@@ -116,9 +116,6 @@ static int copy_and_remap_folio(struct folio *src, struct folio *dst)
 		return -EAGAIN;
 
 	mapping = folio_mapping(src);
-	if (!mapping)
-		goto out;
-
 	if (!folio_trylock(dst))
 		goto out;
 
@@ -139,7 +136,7 @@ static int copy_and_remap_folio(struct folio *src, struct folio *dst)
 	if (remap_args.mapped_new_folio)
 		rc = MIGRATEPAGE_SUCCESS;
 	else
-		rc = -EAGAIN;
+		rc = MIGRATEPAGE_UNMAP;
 
 out2:
 	folio_unlock(dst);
@@ -162,7 +159,6 @@ static int unmap_and_move_folio(struct folio *folio, new_folio_t getfolio,
 		return -ENOMEM;
 
 	rc = copy_and_remap_folio(folio, newfolio);
-	printk(KERN_INFO "copy_remap: rc %d\n", rc);
 
 	if (rc != -EAGAIN) {
 		/* If not trying again, we dont need folio anymore */
@@ -196,9 +192,6 @@ int congestier_migrate_pages(struct list_head *folios,
 		retry = 0;
 		list_for_each_entry_safe(pos, next, folios, lru) {
 			rc = unmap_and_move_folio(pos, new_folio, free_folio, private);
-			printk(KERN_INFO "unmap_move: rc=%d migr=%d retry=%d nfail=%d\n",
-							rc, *nr_migrated, retry, nr_failed);
-
 			switch (rc) {
 			case MIGRATEPAGE_SUCCESS:
 				(*nr_migrated)++;
@@ -218,8 +211,6 @@ int congestier_migrate_pages(struct list_head *folios,
 	nr_failed += retry;
 	rc = nr_failed;
 out:
-	printk(KERN_INFO "cmp: rc=%d migr=%d retry=%d nfail=%d\n",
-			rc, *nr_migrated, retry, nr_failed);
 	return rc;
 }
 

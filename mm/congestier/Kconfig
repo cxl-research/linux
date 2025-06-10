@@ -5,26 +5,26 @@ menu "Congestion Tiering"
 config CONGESTIER
 	bool "Congestion Tiering"
 	help
-	  A framework for tiering between DRAM and CXL memory for
+		A framework for tiering between DRAM and CXL memory for
 		performance in a bandwidth-constrained environment.
-	  
+
 choice
 	prompt "Page Temperature Tracker"
 	depends on CONGESTIER
 	default CONGESTIER_PGTEMP_PEBS
 	help
-	  Framework for tracking memory temperature.
-	  This provides input for tiering decisions.
+		Framework for tracking memory temperature.
+		This provides input for tiering decisions.
 		Default is PEBS.
 
 config CONGESTIER_PGTEMP_PEBS
 	bool "PEBS"
 	depends on CONGESTIER
 	help
-	  PEBS (Precise Event Based Sampling) is a hardware feature
-	  that allows for precise sampling of events in the CPU.
-	  This option enables the use of PEBS for tracking memory temperature.
-	  This is the default option.
+		PEBS (Precise Event Based Sampling) is a hardware feature
+		that allows for precise sampling of events in the CPU.
+		This option enables the use of PEBS for tracking memory temperature.
+		This is the default option.
 
 		If PEBS is the tracker, then we create a device "/dev/pebs".
 		This device must be mapped by a user process and filled with
@@ -36,14 +36,14 @@ config CONGESTIER_PGTEMP_DAMON
 	bool "DAMON"
 	depends on CONGESTIER
 	help
-	  Use DAMON (Data Access Monitoring) for tracking memory temperature.
+		Use DAMON (Data Access Monitoring) for tracking memory temperature.
 		DAMON must be running on the targeted applications.
 
 config CONGESTIER_PGTEMP_TELESCOPE
 	bool "TELESCOPE"
 	depends on CONGESTIER
 	help
-	  Use TELESCOPE for tracking memory temperature.
+		Use TELESCOPE for tracking memory temperature.
 		TELESCOPE must be running on the targeted applications.
 
 endchoice
@@ -53,26 +53,26 @@ choice
 	depends on CONGESTIER
 	default CONGESTIER_SIMPLE_MIGRATE
 	help
-	  How should folios be migrated between DRAM and CXL memory?
+		How should folios be migrated between DRAM and CXL memory?
 
 config CONGESTIER_SIMPLE_MIGRATE
 	bool "Simple Migration"
 	depends on CONGESTIER
 	help
-	  Simply call migrate_pages()
+		Simply call migrate_pages()
 
 config CONGESTIER_TRANSACTIONAL_MIGRATE
 	bool "Transactional Page Migration"
 	depends on CONGESTIER
 	help
-	  Copy the folios to the target memory and remap it.
+		Copy the folios to the target memory and remap it.
 
 config CONGESTIER_SHADOW_PAGING
 	bool "Shadow Paging"
 	depends on CONGESTIER
 	help
-	  Save the old copies of the folios in a shadow page table.
-	  This allows for faster migration and rollback if needed.
+		Save the old copies of the folios in a shadow page table.
+		This allows for faster migration and rollback if needed.
 
 endchoice
 
