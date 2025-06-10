@@ -10,6 +10,7 @@
 #include <linux/fs.h>
 #include <linux/kthread.h>
 #include <linux/ktime.h>
+#include <linux/migrate.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
@@ -78,6 +79,24 @@ extern enum tiering_mode sysctl_tiering_mode;
 extern int tier_frame_pg_order;
 extern enum tiering_interleave_mode tiering_interleave_mode;
 
+static inline int folio_is_not_mapped(struct folio *folio)
+{
+	return !folio_mapped(folio);
+}
+
+static inline int ptep_test_and_clear_dirty(struct mm_struct *mm,
+		unsigned long addr, pte_t *ptep)
+{
+	pte_t pte = ptep_get(ptep);
+	int dirty = 0;
+	if (pte_dirty(pte)) {
+		dirty = 1;
+		pte = pte_mkclean(pte);
+		set_pte_at(mm, addr, ptep, pte);
+	}
+	return dirty;
+}
+
 int tiering_start(void);
 int tiering_stop(void);
 void reset_tiering_ctx(void);
@@ -102,3 +121,11 @@ struct temperature_class *get_temp_cls(int idx);
 void reset_pebs_tracking(void);
 
 #endif /* CONFIG_CONGESTIER_PGTEMP_PEBS */
+
+#ifdef CONFIG_CONGESTIER_SIMPLE_MIGRATE
+#define congestier_migrate_pages migrate_pages
+#else
+int congestier_migrate_pages(struct list_head *from,
+			new_folio_t new, free_folio_t free, unsigned long private,
+			enum migrate_mode mode, int reason, unsigned int *ret);
+#endif

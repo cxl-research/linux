@@ -7,7 +7,6 @@
  */
 
 #include <linux/congestier.h>
-#include <linux/migrate.h>
 #include <linux/pagewalk.h>
 
 #include "../internal.h"
@@ -35,19 +34,6 @@ static int tiering_reset_epochs = 10;
 
 static int epochid = 0;
 static int next_tiering_epoch = 0;
-
-static inline int ptep_test_and_clear_dirty(struct mm_struct *mm,
-		unsigned long addr, pte_t *ptep)
-{
-	pte_t pte = ptep_get(ptep);
-	int dirty = 0;
-	if (pte_dirty(pte)) {
-		dirty = 1;
-		pte = pte_mkclean(pte);
-		set_pte_at(mm, addr, ptep, pte);
-	}
-	return dirty;
-}
 
 static bool tiering_need_stop(void)
 {
@@ -277,7 +263,7 @@ static const struct mm_walk_ops tiering_mk_candidate_ops = {
 
 static unsigned int congestier_promote_pages(struct list_head *folios)
 {
-	unsigned int nr_migrated = 0;
+	unsigned int nr_migrated = 0, ret;
 	nodemask_t allowed_mask = NODE_MASK_NONE;
 	struct migration_target_control mtc = {
 		.gfp_mask = GFP_HIGHUSER_MOVABLE,
@@ -288,9 +274,11 @@ static unsigned int congestier_promote_pages(struct list_head *folios)
 	if (list_empty(folios))
 		return 0;
 
-	migrate_pages(folios, alloc_migrate_folio, NULL,
+	ret = congestier_migrate_pages(folios, alloc_migrate_folio, NULL,
 		      (unsigned long)&mtc, MIGRATE_ASYNC, MR_CONGESTIER,
 		      &nr_migrated);
+
+	printk(KERN_INFO "promote: ret %d migrated %u\n", ret, nr_migrated);
 
 	return nr_migrated;
 }
@@ -300,7 +288,8 @@ static unsigned int congestier_demote_pages(struct list_head *folios)
 	nodemask_t allowed_mask = NODE_MASK_NONE;
 	struct migration_target_control mtc2, mtc3;
 	struct list_head *mid, *tmp;
-	unsigned int nlist = 0, nr_migr_2, nr_migr_3, n1=0, n2=0;
+	int ret2, ret3;
+	unsigned int nlist = 0, nr_migr_2, nr_migr_3, n1 = 0, n2 = 0;
 	gfp_t gfp = GFP_HIGHUSER_MOVABLE;
 	LIST_HEAD(fol2);
 	LIST_HEAD(fol3);
@@ -332,10 +321,16 @@ static unsigned int congestier_demote_pages(struct list_head *folios)
 	list_for_each(tmp, &fol3)
 		n2++;
 
-	migrate_pages(&fol2, alloc_migrate_folio, NULL, (unsigned long)&mtc2,
-		      MIGRATE_ASYNC, MR_DAMON, &nr_migr_2);
-	migrate_pages(&fol3, alloc_migrate_folio, NULL, (unsigned long)&mtc3,
-		      MIGRATE_ASYNC, MR_DAMON, &nr_migr_3);
+	ret2 = congestier_migrate_pages(&fol2, alloc_migrate_folio, NULL,
+															(unsigned long)&mtc2, MIGRATE_ASYNC,
+															MR_CONGESTIER, &nr_migr_2);
+	ret3 = congestier_migrate_pages(&fol3, alloc_migrate_folio, NULL,
+															(unsigned long)&mtc3, MIGRATE_ASYNC,
+															MR_CONGESTIER, &nr_migr_3);
+
+	printk(KERN_INFO "demote: ret %d %d migr %u %u\n",
+							ret2, ret3, nr_migr_2, nr_migr_3);
+
 	return (nr_migr_2 + nr_migr_3);
 }
 
@@ -645,6 +640,7 @@ static int tiering_fn(void *data)
 	while (!tiering_need_stop()) {
 		start = ktime_get_ns();
 
+		migrated = 0;
 		__commit_sysctl_vals();
 
 		pgtemp_track_epoch_work(epochid);

@@ -45,6 +45,35 @@ config CONGESTIER_PGTEMP_TELESCOPE
 	help
 	  Use TELESCOPE for tracking memory temperature.
 		TELESCOPE must be running on the targeted applications.
+
+endchoice
+
+choice
+	prompt "Migration Policy"
+	depends on CONGESTIER
+	default CONGESTIER_SIMPLE_MIGRATE
+	help
+	  How should folios be migrated between DRAM and CXL memory?
+
+config CONGESTIER_SIMPLE_MIGRATE
+	bool "Simple Migration"
+	depends on CONGESTIER
+	help
+	  Simply call migrate_pages()
+
+config CONGESTIER_TRANSACTIONAL_MIGRATE
+	bool "Transactional Page Migration"
+	depends on CONGESTIER
+	help
+	  Copy the folios to the target memory and remap it.
+
+config CONGESTIER_SHADOW_PAGING
+	bool "Shadow Paging"
+	depends on CONGESTIER
+	help
+	  Save the old copies of the folios in a shadow page table.
+	  This allows for faster migration and rollback if needed.
+
 endchoice
 
 endmenu
