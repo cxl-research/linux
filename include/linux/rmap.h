@@ -804,4 +804,7 @@ static inline int folio_mkclean(struct folio *folio)
 }
 #endif	/* CONFIG_MMU */
 
+void set_tlb_ubc_flush_pending(struct mm_struct *mm, pte_t pteval,
+			       unsigned long uaddr);
+
 #endif	/* _LINUX_RMAP_H */

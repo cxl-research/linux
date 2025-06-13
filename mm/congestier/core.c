@@ -505,11 +505,8 @@ static int do_tiering(void)
 	while (!list_empty(&tier_folios)) {
 		folio = lru_to_folio(&tier_folios);
 		list_del(&folio->lru);
-		folio_add_lru(folio);
+		folio_putback_lru(folio);
 	}
-
-	printk(KERN_INFO "do_tiering: DONE\n");
-
 	return nr_migrated;
 }
 
