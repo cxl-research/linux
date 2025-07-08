@@ -50,7 +50,7 @@ static void init_temperature_classes(void)
 	}
 }
 
-static inline int temp_class(uint64_t temp)
+int temp_class(uint64_t temp)
 {
 	int i = 0;
 	while (i < NR_TEMPERATURE_CLASSES && temp > 0) {
@@ -72,7 +72,7 @@ static inline bool reclaimed_recently(pid_t pid)
 
 static inline int target_idx_from_pid(pid_t pid)
 {
-	for (int i = 0; i < nr_targets; ++i) {
+	for (int i = 0; i < MAX_PGTEMP_TARGETS; ++i) {
 		if (targets[i].pid == pid)
 			return i;
 	}
@@ -115,6 +115,8 @@ static void reclaim_dead_targets(void)
 
 		task = find_task_by_vpid(pid);
 		if (!task || !pid_alive(task)) {
+			printk(KERN_INFO "Reclaiming dead target: pid=%d idx=%d\n",
+					pid, i);
 			xa_for_each(&targets[i].blocks, index, blk) {
 				tmpcls = temp_class(blk->ld_temp);
 				cls = get_temp_cls(tmpcls);
@@ -206,6 +208,7 @@ static void free_temperature_class(int clsidx, int epoch_id)
 	struct pg_temp_block *blk;
 	struct temperature_class *cls = &tmpcls[clsidx];
 	struct list_head *pos, *n;
+	int targetidx;
 
 	scrub_temperature_class(clsidx, epoch_id);
 	if (cls->nr_blocks == 0)
@@ -214,8 +217,34 @@ static void free_temperature_class(int clsidx, int epoch_id)
 	mutex_lock(&cls->templock);
 	list_for_each_safe(pos, n, &cls->blocks) {
 		blk = list_entry(pos, struct pg_temp_block, temper_class);
+
+		if ((blk->temper_class.next == LIST_POISON1) ||
+		    (blk->temper_class.prev == LIST_POISON2)) {
+			printk(KERN_INFO "DEBUG: blk %llx %d %llu@%d\n", blk->blocknum,
+								blk->pid, blk->nr_samples_this_epoch_ld, epoch_id);
+		}
+
 		list_del(pos);
 		cls->nr_blocks--;
+
+		targetidx = target_idx_from_pid(blk->pid);
+		if (targetidx < 0) {
+			printk(KERN_WARNING "Freeing block %llx with unknown target pid %d\n",
+					blk->blocknum, blk->pid);
+		}
+
+		if (targetidx >= 0) {
+			xa_lock_bh(&(targets[targetidx].blocks));
+			if (__xa_erase(&targets[targetidx].blocks, blk->blocknum)) {
+				targets[targetidx].nr_blocks--;
+			} else {
+				printk(KERN_WARNING "Failed to erase block %llx for pid %d\n",
+						blk->blocknum, blk->pid);
+			}
+			xa_unlock_bh(&(targets[targetidx].blocks));
+		}
+
+		kfree(blk);
 	}
 	mutex_unlock(&cls->templock);
 	cls->nr_blocks = 0;
@@ -241,11 +270,11 @@ int pebs_track_epoch_work(int epoch_id)
 	struct pg_temp_block *blk;
 	uint64_t head, tail, offset;
 	uint64_t blocknum, period, epspassed, temper;
-	int pid, blockshift, targetidx, err, oldcls, newcls, tier_frame_pages;
+	int pid, blockshift, targetidx, err, oldcls, newcls;
 	int newblks = 0, minor_update_blks = 0, major_update_blks = 0;
+	int scaling_factor_bp;
 
 	blockshift = PAGE_SHIFT + pgtemp_granularity_order;
-	tier_frame_pages = 1 << tier_frame_pg_order;
 	head = READ_ONCE(hdr->head);
 	tail = max(READ_ONCE(hdr->tail), READ_ONCE(hdr->tail_start));
 
@@ -285,12 +314,6 @@ int pebs_track_epoch_work(int epoch_id)
 			blk->pid = pid;
 			INIT_LIST_HEAD(&(blk->temper_class));
 
-			/* Demotion level is 0, as we assume all allocations to be 
-			 * from DRAM initially.
-			 * TODO: Detect VMA mempolicy and set this accordingly.			
-			 */
-			blk->demotion_level = 0;
-
 			blk->tiering_state = NOT_TIERED;
 			blk->tiering_epoch = epoch_id;
 
@@ -306,15 +329,25 @@ int pebs_track_epoch_work(int epoch_id)
 			++newblks;
 
 			mutex_lock(&tmpcls[NEW_BLK_CLS].templock);
+			set_demotion_level(blk);
 			list_add(&blk->temper_class, &tmpcls[NEW_BLK_CLS].blocks);
 			tmpcls[NEW_BLK_CLS].nr_blocks++;
 			mutex_unlock(&tmpcls[NEW_BLK_CLS].templock);
 		} else if (blk->last_updated_epoch == epoch_id) {
-			blk->period_sum_this_epoch_ld += (period * tier_frame_pages) / \
-															(tier_frame_pages - blk->demotion_level);
+			if (blk->total_pages)
+				scaling_factor_bp = 10000 * blk->dram_pages / blk->total_pages;
+			else
+				scaling_factor_bp = 10000;
+			blk->period_sum_this_epoch_ld +=
+				scaling_factor_bp * period / 10000;
 			blk->nr_samples_this_epoch_ld++;
 			++minor_update_blks;
 		} else {
+			if (blk->total_pages)
+				scaling_factor_bp = 10000 * blk->dram_pages / blk->total_pages;
+			else
+				scaling_factor_bp = 10000;
+			blk->period_sum_this_epoch_ld += scaling_factor_bp * period / 10000;
 			epspassed = epoch_id - blk->last_updated_epoch;					
 			oldcls = temp_class(blk->ld_temp);
 			temper = blk->ld_temp + blk->period_sum_this_epoch_ld;
@@ -325,22 +358,24 @@ int pebs_track_epoch_work(int epoch_id)
 				blk->ld_temp = (temper >> epspassed);
 
 			newcls = temp_class(blk->ld_temp);
-			blk->period_sum_this_epoch_ld = (period * tier_frame_pages) / \
-														(tier_frame_pages - blk->demotion_level);
 			blk->nr_samples_this_epoch_ld = 1;
 			blk->last_updated_epoch = epoch_id;
 			++major_update_blks;
 
 			/* move to new temperature class */
 			if (oldcls != newcls) {
+				if ((blk->temper_class.next == LIST_POISON1) ||
+				    (blk->temper_class.prev == LIST_POISON2)) {
+					printk(KERN_INFO "DEBUG: blk %llx %d (%d->%d) %llu@%d\n", blk->blocknum,
+								pid, oldcls, newcls, blk->nr_samples_this_epoch_ld, epoch_id);
+				}
+
 				mutex_lock(&tmpcls[oldcls].templock);
-				list_del(&blk->temper_class);
+				mutex_lock(&tmpcls[newcls].templock);
+				list_move(&blk->temper_class, &tmpcls[newcls].blocks);
+				tmpcls[newcls].nr_blocks++;
 				tmpcls[oldcls].nr_blocks--;
 				mutex_unlock(&tmpcls[oldcls].templock);
-
-				mutex_lock(&tmpcls[newcls].templock);
-				list_add(&blk->temper_class, &tmpcls[newcls].blocks);
-				tmpcls[newcls].nr_blocks++;
 				mutex_unlock(&tmpcls[newcls].templock);
 			}
 		}
@@ -352,6 +387,7 @@ skip_this_sample:
 	for (int tc = NR_TEMPERATURE_CLASSES; tc >= 0; --tc)
 		scrub_temperature_class(tc, epoch_id);
 	reclaim_dead_targets();
+	free_temperature_class(0, epoch_id);
 	debug_print_temperature_classes();
 	printk(KERN_INFO "PEBS epoch %d: (%llu %llu) (%d,%d,%d)\n", 
 				epoch_id, head, tail, newblks,

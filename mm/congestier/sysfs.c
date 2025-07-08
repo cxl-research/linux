@@ -17,9 +17,12 @@
 
 int sysctl_promote_pg_epoch = 0;
 int sysctl_epoch_usecs = 1E6; /* 1 second by default */
-int sysctl_dirty_latency_threshold_usecs = 0; /* 0 by default */
 int sysctl_tiering_epoch_usecs = 1E6; /* 1 second by default */
 enum tiering_mode sysctl_tiering_mode = TIERING_MODE_OFF;
+int sysctl_max_tier_tmpcls = 12;
+int sysctl_min_tier_tmpcls = 1;
+
+EXPORT_SYMBOL_GPL(sysctl_promote_pg_epoch);
 
 static const char *tiering_mode_str[] = {
 	[TIERING_MODE_OFF] = "off",
@@ -28,8 +31,7 @@ static const char *tiering_mode_str[] = {
 
 static const char *tiering_interleave_modestr[] = {
 	[TIM_HALF] = "half",
-	[TIM_GSTEP] = "agestep",
-	[TIM_HSTEP] = "hotstep"
+	[TIM_GSTEP] = "agestep"
 };
 
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
@@ -45,6 +47,62 @@ static const char *pebs_hottrack_state_str[] = {
 };
 
 #endif
+
+static ssize_t max_tier_tmpcls_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", sysctl_max_tier_tmpcls);
+}
+
+static ssize_t max_tier_tmpcls_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int err, tempclass;
+
+	err = kstrtoint(buf, 0, &tempclass);
+	if (err)
+		return err;
+
+	if (tempclass < 1 || tempclass >= NR_TEMPERATURE_CLASSES)
+		return -EINVAL;
+
+	sysctl_max_tier_tmpcls = tempclass;
+	if (sysctl_min_tier_tmpcls > sysctl_max_tier_tmpcls)
+		sysctl_min_tier_tmpcls = sysctl_max_tier_tmpcls;
+
+	return count;
+}
+
+static struct kobj_attribute max_tier_tmpcls_attr =
+		__ATTR_RW(max_tier_tmpcls);
+
+static ssize_t min_tier_tmpcls_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", sysctl_min_tier_tmpcls);
+}
+
+static ssize_t min_tier_tmpcls_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int err, tempclass;
+
+	err = kstrtoint(buf, 0, &tempclass);
+	if (err)
+		return err;
+
+	if (tempclass < 1 || tempclass >= NR_TEMPERATURE_CLASSES)
+		return -EINVAL;
+
+	sysctl_min_tier_tmpcls = tempclass;
+	if (sysctl_min_tier_tmpcls > sysctl_max_tier_tmpcls)
+		sysctl_max_tier_tmpcls = sysctl_min_tier_tmpcls;
+
+	return count;
+}
+
+static struct kobj_attribute min_tier_tmpcls_attr =
+		__ATTR_RW(min_tier_tmpcls);
 
 static ssize_t tiering_epoch_msecs_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
@@ -97,57 +155,32 @@ static ssize_t tiering_interleave_mode_store(struct kobject *kobj,
 static struct kobj_attribute tiering_interleave_mode_attr =
 	__ATTR_RW(tiering_interleave_mode);
 
-static ssize_t tier_frame_pg_order_show(struct kobject *kobj,
-		struct kobj_attribute *attr, char *buf)
-{
-	int order = READ_ONCE(tier_frame_pg_order);
-	return sysfs_emit(buf, "%d\n", order);
-}
+// static ssize_t tier_frame_pg_order_show(struct kobject *kobj,
+// 		struct kobj_attribute *attr, char *buf)
+// {
+// 	int order = READ_ONCE(tier_frame_pg_order);
+// 	return sysfs_emit(buf, "%d\n", order);
+// }
 
-static ssize_t tier_frame_pg_order_store(struct kobject *kobj,
-		struct kobj_attribute *attr, const char *buf, size_t count)
-{
-	int err, neworder;
+// static ssize_t tier_frame_pg_order_store(struct kobject *kobj,
+// 		struct kobj_attribute *attr, const char *buf, size_t count)
+// {
+// 	int err, neworder;
 
-	err = kstrtoint(buf, 0, &neworder);
-	if (err)
-		return err;
+// 	err = kstrtoint(buf, 0, &neworder);
+// 	if (err)
+// 		return err;
 
-	if (neworder < 0 || neworder > 9)
-		return -EINVAL;
+// 	if (neworder < 0 || neworder > 9)
+// 		return -EINVAL;
 
-	WRITE_ONCE(tier_frame_pg_order, neworder);
+// 	WRITE_ONCE(tier_frame_pg_order, neworder);
 
-	return count;
-}
+// 	return count;
+// }
 
-static struct kobj_attribute tier_frame_pg_order_attr =
-	__ATTR_RW(tier_frame_pg_order);
-
-static ssize_t dirty_latency_threshold_msecs_show(struct kobject *kobj,
-		struct kobj_attribute *attr, char *buf)
-{
-	return sysfs_emit(buf, "%d\n", sysctl_dirty_latency_threshold_usecs / 1000);
-}
-
-static ssize_t dirty_latency_threshold_msecs_store(struct kobject *kobj,
-		struct kobj_attribute *attr, const char *buf, size_t count)
-{
-	int err, msecs;
-
-	err = kstrtoint(buf, 0, &msecs);
-	if (err)
-		return err;
-
-	if (msecs < 0 || msecs > 60000) /* 60 seconds max */
-		return -EINVAL;
-
-	sysctl_dirty_latency_threshold_usecs = msecs * 1000;
-	return count;
-}
-
-static struct kobj_attribute dirty_latency_threshold_msecs_attr =
-		__ATTR_RW(dirty_latency_threshold_msecs);
+// static struct kobj_attribute tier_frame_pg_order_attr =
+// 	__ATTR_RW(tier_frame_pg_order);
 
 static ssize_t tiering_mode_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
@@ -416,10 +449,9 @@ static struct kobj_attribute pebs_buf_pg_order_attr =
 
 static struct attribute *congestier_sysfs_attrs[] = {
 	&promote_mb_epoch_attr.attr,
-	&dirty_latency_threshold_msecs_attr.attr,
 	&tiering_mode_attr.attr,
 	&epoch_usecs_attr.attr,
-	&tier_frame_pg_order_attr.attr,
+	// &tier_frame_pg_order_attr.attr,
 	&tiering_interleave_mode_attr.attr,
 	&tiering_epoch_msecs_attr.attr,
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
@@ -427,6 +459,8 @@ static struct attribute *congestier_sysfs_attrs[] = {
 	&pgtemp_granularity_order_attr.attr,
 	&pebs_hottrack_state_attr.attr,
 #endif
+	&max_tier_tmpcls_attr.attr,
+	&min_tier_tmpcls_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(congestier_sysfs);

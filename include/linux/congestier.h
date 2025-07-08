@@ -38,7 +38,6 @@ enum tiering_mode {
 enum tiering_interleave_mode {
 	TIM_HALF,
 	TIM_GSTEP,
-	TIM_HSTEP,
 	NR_TIERING_INTERLEAVE_MODES,
 };
 
@@ -59,7 +58,8 @@ struct pg_temp_block {
 	struct list_head temper_class;
 
 	/* for use in tiering */
-	int demotion_level;
+	// int demotion_level;
+	int dram_pages, cxl_pages, total_pages;
 	enum blk_tiering_state tiering_state;
 	uint64_t tiering_epoch;
 };
@@ -72,11 +72,12 @@ struct temperature_class {
 
 extern int sysctl_promote_pg_epoch;
 extern int sysctl_epoch_usecs;
-extern int sysctl_dirty_latency_threshold_usecs;
 extern int sysctl_tiering_epoch_usecs;
 extern enum tiering_mode sysctl_tiering_mode;
+extern int sysctl_max_tier_tmpcls;
+extern int sysctl_min_tier_tmpcls;
 
-extern int tier_frame_pg_order;
+// extern int tier_frame_pg_order;
 extern enum tiering_interleave_mode tiering_interleave_mode;
 
 static inline int folio_is_not_mapped(struct folio *folio)
@@ -118,7 +119,9 @@ int pebs_tracking_stop(void);
 int pebs_track_epoch_work(int epoch_id);
 void pebs_track_init(void);
 struct temperature_class *get_temp_cls(int idx);
+int temp_class(uint64_t temp);
 void reset_pebs_tracking(void);
+int set_demotion_level(struct pg_temp_block *blk);
 
 #endif /* CONFIG_CONGESTIER_PGTEMP_PEBS */
 

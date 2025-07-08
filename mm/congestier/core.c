@@ -11,6 +11,8 @@
 
 #include "../internal.h"
 
+#define MIN_DRAM_OCC_BLK_PGS 1
+
 struct tiering_candidate {
 	struct pg_temp_block *blk;
 	struct list_head siblings;
@@ -20,17 +22,19 @@ struct tiering_ctx {
 	struct task_struct *task;
 	struct list_head dram_cands;
 	struct list_head cxl_cands;
+	int nr_dram_cands, nr_cxl_cands;
 } __tierctx;
 
-int tier_frame_pg_order = 3; /* 8-page frames by default  */
+// int tier_frame_pg_order = 3; /* 8-page frames by default  */
 enum tiering_interleave_mode tiering_interleave_mode = TIM_HALF;
 
 static int promote_pg_epoch = 0;
-static int epoch_usecs = 1E5; /* 100ms by default */
+static int epoch_usecs = 1E6; /* 1s by default */
 static int tiering_epoch_usecs = 1E6; /* 1 second by default */
-static int dirty_latency_threshold_usecs = 2E5; /* 200ms by default */
 static enum tiering_mode tiering_mode = TIERING_MODE_OFF;
-static int tiering_reset_epochs = 10;
+static int tiering_reset_epochs = 1;
+static int TIER_TEMPCLS_MAX = 12;
+static int TIER_TEMPCLS_MIN = 1;
 
 static int epochid = 0;
 static int next_tiering_epoch = 0;
@@ -135,14 +139,14 @@ static int pgtemp_track_epoch_work(int epoch_id) { return 0; }
 
 #endif /* CONFIG_CONGESTIER_PGTEMP_PEBS */
 
-static bool can_dec_demotion_level(struct pg_temp_block *blk) 
+static bool can_promote_once(struct pg_temp_block *blk)
 {
 	enum tiering_interleave_mode mode = READ_ONCE(tiering_interleave_mode);
 	bool candec = false;
 	switch (mode) {
 	case TIM_HALF:
 	case TIM_GSTEP:
-		if (blk->demotion_level > 0)
+		if (blk->cxl_pages > 0)
 			candec = true;
 		break;
 	default:
@@ -150,17 +154,32 @@ static bool can_dec_demotion_level(struct pg_temp_block *blk)
 	return candec;
 }
 
-static bool can_inc_demotion_level(struct pg_temp_block *blk)
+// static bool can_dec_demotion_level(struct pg_temp_block *blk) 
+// {
+// 	enum tiering_interleave_mode mode = READ_ONCE(tiering_interleave_mode);
+// 	bool candec = false;
+// 	switch (mode) {
+// 	case TIM_HALF:
+// 	case TIM_GSTEP:
+// 		if (blk->demotion_level > 0)
+// 			candec = true;
+// 		break;
+// 	default:
+// 	}
+// 	return candec;
+// }
+
+static bool can_demote_once(struct pg_temp_block *blk)
 {
 	enum tiering_interleave_mode mode = READ_ONCE(tiering_interleave_mode);
 	bool caninc = false;
 	switch (mode) {
 	case TIM_HALF:
-		if (blk->demotion_level < (1 << (tier_frame_pg_order - 1)))
+		if (blk->cxl_pages < (blk->total_pages / 2))
 			caninc = true;
 		break;
 	case TIM_GSTEP:
-		if (blk->demotion_level < ((1 << tier_frame_pg_order) - 1))
+		if (blk->dram_pages > MIN_DRAM_OCC_BLK_PGS)
 			caninc = true;
 		break;
 	default:
@@ -168,97 +187,134 @@ static bool can_inc_demotion_level(struct pg_temp_block *blk)
 	return caninc;
 }
 
-static inline int gstepdown(int level)
-{
-	int new_level = (1 << tier_frame_pg_order) - 1, step = 1;
-	while (new_level >= level) {
-		new_level -= step;
-		step <<= 1;
-	}
-	return new_level;
-}
+// static bool can_inc_demotion_level(struct pg_temp_block *blk)
+// {
+// 	enum tiering_interleave_mode mode = READ_ONCE(tiering_interleave_mode);
+// 	bool caninc = false;
+// 	switch (mode) {
+// 	case TIM_HALF:
+// 		if (blk->demotion_level < (1 << (tier_frame_pg_order - 1)))
+// 			caninc = true;
+// 		break;
+// 	case TIM_GSTEP:
+// 		if (blk->demotion_level < ((1 << tier_frame_pg_order) - 1))
+// 			caninc = true;
+// 		break;
+// 	default:
+// 	}
+// 	return caninc;
+// }
 
-static inline int gstepup(int level)
-{
-	int new_level = 0, step = (1 << (tier_frame_pg_order - 1));
-	while (new_level <= level) {
-		new_level += step;
-		step >>= 1;
-	}
-	return new_level;
-}
+// static inline int gstepdown(int level)
+// {
+// 	int new_level = (1 << tier_frame_pg_order) - 1, step = 1;
+// 	while (new_level >= level) {
+// 		new_level -= step;
+// 		step <<= 1;
+// 	}
+// 	return new_level;
+// }
 
-static int prev_demotion_level(struct pg_temp_block *blk)
+// static inline int gstepup(int level)
+// {
+// 	int new_level = 0, step = (1 << (tier_frame_pg_order - 1));
+// 	while (new_level <= level) {
+// 		new_level += step;
+// 		step >>= 1;
+// 	}
+// 	return new_level;
+// }
+
+// static int prev_demotion_level(struct pg_temp_block *blk)
+// {
+// 	enum tiering_interleave_mode mode = READ_ONCE(tiering_interleave_mode);
+// 	switch(mode) {
+// 		case TIM_HALF:
+
+// 	}
+// }
+
+static int demote_once_pages(struct pg_temp_block *blk)
 {
 	enum tiering_interleave_mode mode = READ_ONCE(tiering_interleave_mode);
-	int dlev = blk->demotion_level, ret = -EINVAL;
+	int demote_pages = 0, total_pages = blk->total_pages;
 	switch (mode) {
 	case TIM_HALF:
-		ret = 0;
+		demote_pages = (total_pages / 2) - blk->cxl_pages;
+		if (demote_pages < 0)
+			return 0;
 		break;
 	case TIM_GSTEP:
-		ret = gstepdown(dlev);
+		while ((total_pages /= 2)) {
+			demote_pages += total_pages;
+			if (demote_pages > blk->cxl_pages)
+				break;
+		}
+		demote_pages -= blk->cxl_pages;
 		break;
 	default:
 	}
-	return ret;
+	if (demote_pages > blk->dram_pages - MIN_DRAM_OCC_BLK_PGS)
+		demote_pages = blk->dram_pages - MIN_DRAM_OCC_BLK_PGS;
+	return demote_pages;
 }
 
-static int next_demotion_level(struct pg_temp_block *blk)
+static int promote_once_pages(struct pg_temp_block *blk)
 {
 	enum tiering_interleave_mode mode = READ_ONCE(tiering_interleave_mode);
-	int dlev = blk->demotion_level, ret = -EINVAL;
+	int promote_pages = 0, total_pages = blk->total_pages;
 	switch (mode) {
 	case TIM_HALF:
-		ret = 1 << (tier_frame_pg_order - 1);
+		promote_pages = blk->cxl_pages;
 		break;
 	case TIM_GSTEP:
-		ret = gstepup(dlev);
-		break;
+		while ((total_pages /= 2)) {
+			promote_pages = total_pages;
+			if (promote_pages <= blk->cxl_pages)
+				break;
+		}
 	default:
 	}
-	return ret;
+	return promote_pages;
 }
+
+// static int prev_demotion_level(struct pg_temp_block *blk)
+// {
+// 	enum tiering_interleave_mode mode = READ_ONCE(tiering_interleave_mode);
+// 	int dlev = blk->demotion_level, ret = -EINVAL;
+// 	switch (mode) {
+// 	case TIM_HALF:
+// 		ret = 0;
+// 		break;
+// 	case TIM_GSTEP:
+// 		ret = gstepdown(dlev);
+// 		break;
+// 	default:
+// 	}
+// 	return ret;
+// }
+
+// static int next_demotion_level(struct pg_temp_block *blk)
+// {
+// 	enum tiering_interleave_mode mode = READ_ONCE(tiering_interleave_mode);
+// 	int dlev = blk->demotion_level, ret = -EINVAL;
+// 	switch (mode) {
+// 	case TIM_HALF:
+// 		ret = 1 << (tier_frame_pg_order - 1);
+// 		break;
+// 	case TIM_GSTEP:
+// 		ret = gstepup(dlev);
+// 		break;
+// 	default:
+// 	}
+// 	return ret;
+// }
 
 struct tiering_pgwalk_private {
 	struct tiering_candidate *tiering_candidate;
 	struct list_head *folio_list;
-	int nr_candidates, nr_migratable, oldlevel, newlevel;
-	bool tier_promote, update_blk; /* true for promotion, false for demotion */
-};
-
-static int mk_tiering_candidate(pte_t *ptep, unsigned long addr,
-				unsigned long next, struct mm_walk *walk)
-{
-	struct tiering_pgwalk_private *priv = walk->private;
-	struct page *page;
-	int nid;
-
-	if (pte_none(*ptep) || !pte_present(*ptep))
-		goto skip_page;
-
-	page = pte_page(*ptep);
-	if (!page || PageTail(page))
-		goto skip_page;
-
-	nid = page_to_nid(page);
-
-	/* skip page if it is not on the right src tier */
-	if ((!priv->tier_promote && CXLNID(nid)) ||
-	    (priv->tier_promote && !CXLNID(nid))) {
-		goto skip_page;
-	}
-
-	ptep_test_and_clear_dirty(walk->mm, addr, ptep);
-	priv->nr_candidates++;
-	return 0;
-skip_page:
-	return 0;
-}
-
-static const struct mm_walk_ops tiering_mk_candidate_ops = {
-	.pte_entry = mk_tiering_candidate,
-	.walk_lock = PGWALK_RDLOCK,
+	int target_cand_pgs, found_cand_pgs, oldlevel, newlevel;
+	bool tier_promote; /* true for promotion, false for demotion */
 };
 
 static unsigned int congestier_promote_pages(struct list_head *folios)
@@ -345,23 +401,7 @@ static int do_tiering_ptep(pte_t *ptep, unsigned long addr,
 	struct page *page;
 	struct folio *folio;
 	pte_t pte = ptep_get(ptep);
-	int nid, tier_frame_offset, tier_frame_pages;
-
-	tier_frame_pages = 1 << tier_frame_pg_order;
-	tier_frame_offset = (addr >> PAGE_SHIFT) & (tier_frame_pages - 1);
-	if (priv->tier_promote) {
-		/* exp: oldlevel >= tfoffset > newlevel */
-		if (tier_frame_offset <= priv->newlevel ||
-		    tier_frame_offset > priv->oldlevel) {
-			goto out;
-		}
-	} else {
-		/* exp: oldlevel < tfoffset <= newlevel */
-		if (tier_frame_offset > priv->newlevel ||
-		    tier_frame_offset <= priv->oldlevel) {
-			goto out;
-		}
-	}
+	int nid, ret = 0;
 
 	if (pte_none(pte) || !pte_present(pte))
 		goto out;
@@ -377,26 +417,24 @@ static int do_tiering_ptep(pte_t *ptep, unsigned long addr,
 		goto out;
 	}
 
-	priv->nr_candidates++;
-	if (!pte_dirty(pte)) {
-		/* If the page is not dirty, add it to folio_list */
-		folio = page_folio(page);
-		if (!folio_test_lru(folio) || !folio_try_get(folio))
-			goto out;
-		if (unlikely(page_folio(page) != folio || !folio_test_lru(folio)))
-			goto put_folio;
+	folio = page_folio(page);
+	if (!folio_test_lru(folio) || !folio_try_get(folio))
+		goto out;
+	if (unlikely(page_folio(page) != folio || !folio_test_lru(folio)))
+		goto put_folio;
 
-		if (!folio_isolate_lru(folio))
-			goto put_folio;
+	if (!folio_isolate_lru(folio))
+		goto put_folio;
 
-		list_add(&folio->lru, priv->folio_list);
-		priv->nr_migratable++;
+	list_add(&folio->lru, priv->folio_list);
+	priv->found_cand_pgs++;
+	if (priv->found_cand_pgs >= priv->target_cand_pgs)
+		ret = -1; /* Stop walking */
 put_folio:
-		folio_put(folio);
-	}
+	folio_put(folio);
 
 out:
-	return 0;
+	return ret;
 }
 
 static const struct mm_walk_ops tiering_core_ops = {
@@ -407,22 +445,22 @@ static const struct mm_walk_ops tiering_core_ops = {
 static int do_tiering(void)
 {
 	struct pg_temp_block *blk;
-	struct tiering_candidate *pos, *n;
+	struct tiering_candidate *cand, *cand2;
 	struct list_head *tier_head;
 	struct folio *folio;
 	struct task_struct *task;
 	struct mm_struct *mm;
 	struct tiering_pgwalk_private tierinfo = {
-		.nr_candidates = 0, .nr_migratable = 0,
+		.target_cand_pgs = 0, .found_cand_pgs = 0,
 		.tiering_candidate = NULL,
 		.tier_promote = (promote_pg_epoch > 0),
-		.update_blk = false, .folio_list = NULL,
+		.folio_list = NULL,
 	};
 	uint64_t addr_start, addr_end;
-	unsigned nr_migrated = 0, nr_migratable = 0, nr_tried = 0;
+	unsigned nr_migrated = 0, nr_migratable = 0;
 	uint8_t target_nid_mask, blkshift;
 	pid_t pid;
-	int numpages = READ_ONCE(promote_pg_epoch), newlevel;
+	int numpages = READ_ONCE(promote_pg_epoch), *nrcands;
 	bool canpromote, candemote;
 	LIST_HEAD(tier_folios);
 
@@ -433,9 +471,11 @@ static int do_tiering(void)
 
 	if (!tierinfo.tier_promote) {
 		tier_head = &__tierctx.dram_cands;
+		nrcands = &(__tierctx.nr_dram_cands);
 		target_nid_mask = CXL_NID_MASK;
 	} else if (tierinfo.tier_promote) {
 		tier_head = &__tierctx.cxl_cands;
+		nrcands = &(__tierctx.nr_cxl_cands);
 		target_nid_mask = DRAM_NID_MASK;
 	} else
 		return 0;
@@ -444,20 +484,21 @@ static int do_tiering(void)
 			epochid, target_nid_mask);
 
 	blkshift = PAGE_SHIFT + pgtemp_granularity_order;
-	list_for_each_entry_safe_reverse(pos, n, tier_head, siblings) {
-		blk = pos->blk;
+	list_for_each_entry_safe_reverse(cand, cand2, tier_head, siblings) {
+		blk = cand->blk;
 		if (blk->tiering_state != TIERING_CANDIDATE)
 			continue;
 		if (blk->tiering_epoch > epochid)
 			continue;
 
-		canpromote = tierinfo.tier_promote && can_dec_demotion_level(blk);
-		candemote = !tierinfo.tier_promote && can_inc_demotion_level(blk);
+		canpromote = tierinfo.tier_promote && can_promote_once(blk);
+		candemote = !tierinfo.tier_promote && can_demote_once(blk);
 		if (!canpromote && !candemote)
 			continue;
 
-		list_del(&pos->siblings);
-		kfree(pos);
+		list_del(&cand->siblings);
+		kfree(cand);
+		(*nrcands)--;
 
 		pid = blk->pid;
 		task = find_task_by_vpid(pid);
@@ -465,43 +506,58 @@ static int do_tiering(void)
 			printk(KERN_ERR "do_tiering: task %d not found\n", pid);
 			continue;
 		}
+
 		mm = get_task_mm(task);
+		if (!mm)
+			goto putback_return;
+		mmap_read_lock(mm);
 
 		tierinfo.folio_list = &tier_folios;
 		addr_start = blk->blocknum << blkshift;
-		addr_end = addr_start + min((numpages << PAGE_SHIFT),
-					(1 << (pgtemp_granularity_order + PAGE_SHIFT)));
-		tierinfo.nr_migratable = 0;
-		tierinfo.nr_candidates = 0;
+		if (tierinfo.tier_promote)
+			tierinfo.target_cand_pgs = min(promote_once_pages(blk), numpages);
+		else
+			tierinfo.target_cand_pgs = min(demote_once_pages(blk), numpages);
+		addr_end = addr_start + (1 << blkshift);
 
-		newlevel = tierinfo.tier_promote ? 
-				prev_demotion_level(blk) : next_demotion_level(blk);
-		tierinfo.oldlevel = blk->demotion_level;
-		tierinfo.newlevel = newlevel;
+		// newlevel = tierinfo.tier_promote ? 
+		// 		prev_demotion_level(blk) : next_demotion_level(blk);
+		// tierinfo.oldlevel = blk->demotion_level;
+		// tierinfo.newlevel = newlevel;
 
-		mmap_read_lock(mm);
+		// printk(KERN_INFO "do_tiering start: %p, pid %d, "
+		// 		"addr_start %llx, addr_end %llx, "
+		// 		"oldlevel %d, newlevel %d tempclass %d\n",
+		// 		blk, pid, addr_start, addr_end,
+		// 		tierinfo.oldlevel, tierinfo.newlevel, temp_class(blk->ld_temp));
 		walk_page_range(mm, addr_start, addr_end,
 				&tiering_core_ops, &tierinfo);
 		mmap_read_unlock(mm);
 		mmput(mm);
+		// printk(KERN_INFO "do_tiering end: blk %p, pid %d, "
+		// 		"nr_migratable %d, nr_candidates %d\n",
+		// 		blk, pid, tierinfo.nr_migratable,
+		// 		tierinfo.nr_candidates);
 
-		nr_migratable += tierinfo.nr_migratable;
-		nr_tried += tierinfo.nr_candidates;
+		nr_migratable += tierinfo.found_cand_pgs;
 		blk->tiering_state = TIERED;
-		blk->demotion_level = newlevel;
-	}
+		// blk->demotion_level = newlevel;
 
-	printk(KERN_INFO "do_tiering: %u/%u migratable\n",
-				nr_migratable, nr_tried);
+		numpages -= tierinfo.found_cand_pgs;
+		if (numpages <= 0)
+			break;
+	}
 
 	/* Migrate the folios in tier_folios */
 	nr_migrated = congestier_migrate_folios(&tier_folios,
 					target_nid_mask);
 
-	printk(KERN_INFO "do_tiering: migrated %u folios\n", nr_migrated);
+	printk(KERN_INFO "do_tiering: migrated %u (of %u) folios\n",
+				nr_migrated, nr_migratable);
 
 	try_to_unmap_flush();
 
+putback_return:
 	while (!list_empty(&tier_folios)) {
 		folio = lru_to_folio(&tier_folios);
 		list_del(&folio->lru);
@@ -510,103 +566,226 @@ static int do_tiering(void)
 	return nr_migrated;
 }
 
-static int mk_candidate_blk(struct pg_temp_block *blk,
-														int epochid)
+struct setdl_private {
+	int nr_dram_pages, nr_cxl_pages, nr_total_pages;
+};
+
+static int setdlpte(pte_t *ptep, unsigned long addr, unsigned long next,
+	 struct mm_walk *walk)
+{
+	struct setdl_private *priv = walk->private;
+	struct page *page;
+	pte_t pte = ptep_get(ptep);
+	int nid;
+
+	if (pte_none(pte) || !pte_present(pte))
+		return 0;
+
+	page = pte_page(pte);
+	if (!page || PageTail(page))
+		return 0;
+
+	priv->nr_total_pages++;
+	nid = page_to_nid(page);
+	if (nid & DRAM_NID_MASK) {
+		priv->nr_dram_pages++;
+	} else if (nid & CXL_NID_MASK) {
+		priv->nr_cxl_pages++;
+	}
+
+	return 0;
+}
+
+static const struct mm_walk_ops setdlops = {
+	.pte_entry = setdlpte,
+	.walk_lock = PGWALK_RDLOCK,
+};
+
+int set_demotion_level(struct pg_temp_block *blk)
 {
 	struct task_struct *task;
 	struct mm_struct *mm;
+	uint64_t start, end;
+	int blkshift = PAGE_SHIFT + pgtemp_granularity_order;
+	struct setdl_private priv = { 0, 0, 0 };
+
+	task = find_task_by_vpid(blk->pid);
+	if (!task)
+		return -EINVAL;
+
+	mm = get_task_mm(task);
+	if (!mm)
+		return -EINVAL;
+
+	start = blk->blocknum << blkshift;
+	end = start + (1 << blkshift);
+
+	mmap_read_lock(mm);
+	walk_page_range(mm, start, end, &setdlops, &priv);
+	mmap_read_unlock(mm);
+	mmput(mm);
+
+	blk->dram_pages = priv.nr_dram_pages;
+	blk->cxl_pages = priv.nr_cxl_pages;
+	blk->total_pages = priv.nr_total_pages;
+
+	return 0;
+}
+
+static bool mk_candidate_blk(struct pg_temp_block *blk,
+														int epochid, bool is_promote)
+{
 	struct tiering_candidate *candidate;
-	struct tiering_pgwalk_private tierinfo = {
-		.nr_candidates = 0, .nr_migratable = 0,
-		.tiering_candidate = NULL,
-		.tier_promote = (promote_pg_epoch > 0),
-		.update_blk = false, .folio_list = NULL,
-	};
-	uint64_t addr_start, addr_end;
-	int blkshift, dlt_epochs, num_pages, nr_candidates = 0;
-	pid_t pid;
 	bool canpromote, candemote;
 
-	blkshift = PAGE_SHIFT + pgtemp_granularity_order;
-	dlt_epochs = dirty_latency_threshold_usecs / epoch_usecs;
-	num_pages = READ_ONCE(promote_pg_epoch);
-	if (!num_pages)
-		return 0;
-	if (num_pages < 0)
-		num_pages *= -1;
+	set_demotion_level(blk);
+	canpromote = can_promote_once(blk);
+	candemote = can_demote_once(blk);
 
 	if (blk->tiering_state == NOT_TIERED) {
+		if ((is_promote && !canpromote) || (!is_promote && !candemote))
+			return false;
+			
 		blk->tiering_state = TIERING_CANDIDATE;
-		blk->tiering_epoch = epochid + dlt_epochs;
-
-		pid = blk->pid;
-		addr_start = blk->blocknum << blkshift;
-		addr_end = addr_start + min((num_pages << PAGE_SHIFT),
-					(1 << (pgtemp_granularity_order + PAGE_SHIFT)));
-
-		task = find_task_by_vpid(pid);
-		if (!task)
-			return -ENOENT;
-
-		mm = get_task_mm(task);
-		if (!mm)
-			return -ENOMEM;
+		blk->tiering_epoch = epochid;
 
 		candidate = kmalloc(sizeof(struct tiering_candidate), GFP_KERNEL);
 		candidate->blk = blk;
-		if (tierinfo.tier_promote)
-			list_add(&candidate->siblings, &__tierctx.cxl_cands);
-		else
+		if (!is_promote) {
 			list_add(&candidate->siblings, &__tierctx.dram_cands);
-		tierinfo.tiering_candidate = candidate;
-		tierinfo.nr_candidates = 0;
-
-		mmap_read_lock(mm);
-		walk_page_range(mm, addr_start, addr_end,
-				&tiering_mk_candidate_ops, &tierinfo);
-		mmap_read_unlock(mm);
-		mmput(mm);
-
-		nr_candidates = tierinfo.nr_candidates;
+			__tierctx.nr_dram_cands++;
+		} else {
+			list_add(&candidate->siblings, &__tierctx.cxl_cands);
+			__tierctx.nr_cxl_cands++;
+		}
+		return true;
 	} else if (blk->tiering_state == TIERED) {
 		if (blk->tiering_epoch + tiering_reset_epochs <= epochid) {
-			canpromote = tierinfo.tier_promote && can_dec_demotion_level(blk);
-			candemote = !tierinfo.tier_promote && can_inc_demotion_level(blk);
 			if (canpromote || candemote)	
 				blk->tiering_state = NOT_TIERED;
 		}
+		return false;
 	}
-	return nr_candidates;
+
+	return false;
 }
 
-static void find_tiering_candidates(void)
+static inline int exp_pages_in_block(void)
+{
+	return (1 << pgtemp_granularity_order);
+}
+
+// static inline int tierable_pages(int total_pages)
+// {
+// 	int framesz = (1 << tier_frame_pg_order), tierable_per_frame;
+// 	switch (READ_ONCE(tiering_interleave_mode)) {
+// 	case TIM_HALF:
+// 		tierable_per_frame = framesz / 2;
+// 		break;
+// 	case TIM_GSTEP:
+// 		tierable_per_frame = framesz - 1;
+// 		break;
+// 	default:
+// 		tierable_per_frame = 0;
+// 	}
+// 	return (total_pages / framesz) * tierable_per_frame;
+// }
+
+/* we assume `totalpages` contiguous , start and end 2MB-aligned */
+static inline int tierable_pages(int total_pages)
+{
+	int nr_pages, nr_blks;
+	int blkshift = PAGE_SHIFT + pgtemp_granularity_order;
+	switch (READ_ONCE(tiering_interleave_mode)) {
+	case TIM_HALF:
+		nr_pages = total_pages / 2;
+		break;
+	case TIM_GSTEP:
+		nr_blks = total_pages >> blkshift;
+		nr_pages = total_pages - (nr_blks * MIN_DRAM_OCC_BLK_PGS);
+		break;
+	default:
+	}
+	return nr_pages;
+}
+
+static void reclaim_stale_candidates(int max_candidates)
+{
+	struct tiering_candidate *cand, *cand2;
+	struct pg_temp_block *blk;
+
+	list_for_each_entry_safe(cand, cand2, &__tierctx.dram_cands, siblings) {
+		blk = cand->blk;
+		if (blk->tiering_epoch + tiering_reset_epochs <= epochid) {
+			list_del(&cand->siblings);
+			kfree(cand);
+			__tierctx.nr_dram_cands--;
+		}
+	}
+
+	list_for_each_entry_safe(cand, cand2, &__tierctx.cxl_cands, siblings) {
+		blk = cand->blk;
+		if (blk->tiering_epoch + tiering_reset_epochs <= epochid) {
+			list_del(&cand->siblings);
+			kfree(cand);
+			__tierctx.nr_cxl_cands--;
+		}
+	}
+}
+
+/*
+ * refresh_candidates - Refresh the candidates for tiering.
+ * First clean up the old candidates
+ * and then add candidates to ensure that the max nr of candidates
+ * is not exceeded.
+ */
+static void refresh_candidates(void)
 {
 	struct pg_temp_block *blk, *n;
 	struct temperature_class *cls;
-	int num_pages, nr_candidates = 0;
+	int num_pages, nr_candidates = 0, found_candidates = 0, max_candidates;
+	int blkshift = pgtemp_granularity_order + PAGE_SHIFT;
+	bool is_promote = (promote_pg_epoch > 0);
 
-	num_pages = READ_ONCE(promote_pg_epoch);
-	if (!num_pages)
+	if (!promote_pg_epoch)
 		return;
+
+	num_pages = promote_pg_epoch;
 	if (num_pages < 0)
 		num_pages *= -1;
+	num_pages = (((num_pages >> blkshift) + 1) << blkshift); /* block-align */
 
-	for (int idx = NR_TEMPERATURE_CLASSES - 1; idx >= 0; --idx) {
+	max_candidates = 5 * (num_pages / tierable_pages(exp_pages_in_block())) / 4;
+
+	reclaim_stale_candidates(max_candidates);
+
+	if (is_promote && __tierctx.nr_dram_cands < max_candidates) {
+		nr_candidates = max_candidates - __tierctx.nr_dram_cands;
+	} else if (!is_promote && __tierctx.nr_cxl_cands < max_candidates) {
+		nr_candidates = max_candidates - __tierctx.nr_cxl_cands;
+	} else {
+		printk(KERN_INFO "No candidates to refresh (%d %d %d), skipping\n",
+					__tierctx.nr_dram_cands, __tierctx.nr_cxl_cands, max_candidates);
+		return;
+	}
+
+	for (int idx = TIER_TEMPCLS_MAX; idx >= TIER_TEMPCLS_MIN; --idx) {
 		cls = get_temp_cls(idx);
 		if (!cls || !cls->nr_blocks)
 			continue;
 
 		mutex_lock(&cls->templock);
 		list_for_each_entry_safe(blk, n, &cls->blocks, temper_class) {
-			nr_candidates += mk_candidate_blk(blk, epochid);
-			if (nr_candidates >= num_pages)
+			if (mk_candidate_blk(blk, epochid, is_promote))
+				found_candidates++;
+			if (found_candidates >= nr_candidates)
 				break;
 		}
 		mutex_unlock(&cls->templock);
 	}
 
 	printk(KERN_INFO "Tiering epoch %d: %d candidates\n",
-				epochid, nr_candidates);
+				epochid, found_candidates);
 }
 
 static void __commit_sysctl_vals(void)
@@ -615,7 +794,8 @@ static void __commit_sysctl_vals(void)
 	promote_pg_epoch = READ_ONCE(sysctl_promote_pg_epoch);
 	epoch_usecs = READ_ONCE(sysctl_epoch_usecs);
 	tiering_epoch_usecs = READ_ONCE(sysctl_tiering_epoch_usecs);
-	dirty_latency_threshold_usecs = READ_ONCE(sysctl_dirty_latency_threshold_usecs);
+	TIER_TEMPCLS_MAX = READ_ONCE(sysctl_max_tier_tmpcls);
+	TIER_TEMPCLS_MIN = READ_ONCE(sysctl_min_tier_tmpcls);
 }
 
 static int tiering_fn(void *data)
@@ -625,6 +805,8 @@ static int tiering_fn(void *data)
 
 	INIT_LIST_HEAD(&__tierctx.dram_cands);
 	INIT_LIST_HEAD(&__tierctx.cxl_cands);
+	__tierctx.nr_dram_cands = 0;
+	__tierctx.nr_cxl_cands = 0;
 	pgtemp_track_init();
 
 	while (!tiering_need_stop()) {
@@ -639,16 +821,16 @@ static int tiering_fn(void *data)
 			goto end_epoch;
 
 		if (epochid >= next_tiering_epoch) {
+			refresh_candidates();
+			migrated = do_tiering();
 			next_tiering_epoch = epochid + (tiering_epoch_usecs / epoch_usecs);
-			find_tiering_candidates();
 		}
-		migrated = do_tiering();
 
 end_epoch:
 		end = ktime_get_ns();
 		dur_usecs = (end - start) / 1000;
-		printk(KERN_INFO "Tiering epoch %d took %llu usecs, migrated %d MB\n",
-					epochid, dur_usecs, migrated / 256);
+		printk(KERN_INFO "Tiering epoch %d took %llu usecs, migrated %d KB\n",
+					epochid, dur_usecs, migrated * 4);
 		++epochid;
 
 		printk(KERN_INFO "----------\n");
