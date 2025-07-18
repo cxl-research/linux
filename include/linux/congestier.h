@@ -32,6 +32,7 @@
 enum tiering_mode {
 	TIERING_MODE_OFF,
 	TIERING_MODE_ON,
+	TIERING_ON_FALLBACK_NB,
 	NR_TIERING_MODES,
 };
 
@@ -48,6 +49,12 @@ enum blk_tiering_state {
 	NR_TIER_STATES,
 };
 
+struct pg_temp_target {
+	struct xarray blocks;
+	pid_t pid;
+	int nr_blocks, fallscan_pg_per_block;
+};
+
 struct pg_temp_block {
 	uint64_t ld_temp;
 	uint64_t period_sum_this_epoch_ld;
@@ -58,7 +65,6 @@ struct pg_temp_block {
 	struct list_head temper_class;
 
 	/* for use in tiering */
-	// int demotion_level;
 	int dram_pages, cxl_pages, total_pages;
 	enum blk_tiering_state tiering_state;
 	uint64_t tiering_epoch;
@@ -70,14 +76,13 @@ struct temperature_class {
 	int nr_blocks, tmp_cls_idx;
 };
 
-extern int sysctl_promote_pg_epoch;
+extern long sysctl_promote_pg_epoch;
 extern int sysctl_epoch_usecs;
 extern int sysctl_tiering_epoch_usecs;
+extern int sysctl_stale_usecs;
 extern enum tiering_mode sysctl_tiering_mode;
 extern int sysctl_max_tier_tmpcls;
 extern int sysctl_min_tier_tmpcls;
-
-// extern int tier_frame_pg_order;
 extern enum tiering_interleave_mode tiering_interleave_mode;
 
 static inline int folio_is_not_mapped(struct folio *folio)
@@ -101,6 +106,9 @@ static inline int ptep_test_and_clear_dirty(struct mm_struct *mm,
 int tiering_start(void);
 int tiering_stop(void);
 void reset_tiering_ctx(void);
+
+int fallback_migration(int to_migrate, int nid_mask);
+struct pg_temp_target *get_targets_ptr(int idx);
 
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
 

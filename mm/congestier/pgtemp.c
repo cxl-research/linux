@@ -23,15 +23,11 @@ struct psample {
 	uint32_t cpu, pid;
 };
 
-struct pg_temp_target {
-	struct xarray blocks;
-	pid_t pid;
-	int nr_blocks;
-};
-
 struct pebs_track_ctx {
 	struct task_struct *task;
 } __tempctx;
+
+#define STORE_SAMPLE_MULTIPLIER 10
 
 static struct pg_temp_target targets[MAX_PGTEMP_TARGETS];
 static pid_t recently_reclaimed_pids[MAX_PGTEMP_TARGETS];
@@ -39,6 +35,13 @@ static int nr_targets = 0;
 
 static struct temperature_class tmpcls[NR_TEMPERATURE_CLASSES + 1];
 #define NEW_BLK_CLS (NR_TEMPERATURE_CLASSES)
+
+struct pg_temp_target *get_targets_ptr(int idx)
+{
+	if (idx < 0 || idx >= MAX_PGTEMP_TARGETS)
+		return NULL;
+	return &targets[idx];
+}
 
 static void init_temperature_classes(void)
 {
@@ -91,6 +94,7 @@ static inline int new_target_idx(pid_t pid, int epoch_id)
 		idx++;
 	targets[idx].pid = pid;
 	targets[idx].nr_blocks = 0;
+	targets[idx].fallscan_pg_per_block = 0;
 	xa_init_flags(&(targets[idx].blocks), XA_FLAGS_LOCK_BH);
 	nr_targets++;
 	printk(KERN_INFO "New target: pid=%d idx=%d nr=%d\n",
@@ -140,11 +144,11 @@ static void reclaim_dead_targets(void)
 	}
 }
 
-static void debug_print_temperature_classes(void)
+static void debug_data_structures(void)
 {
 	char *buf = kzalloc(1024, GFP_KERNEL);
 
-	strcpy(buf, "TMPCLS ");
+	strcpy(buf, "TMPCLS: ");
 	for (int i = 0; i <= NR_TEMPERATURE_CLASSES; ++i)
 	{
 		struct temperature_class *cls = &tmpcls[i];
@@ -153,8 +157,17 @@ static void debug_print_temperature_classes(void)
 			sprintf(buf + strlen(buf), "%d:%d ", i, nr_blocks);
 		}
 	}
-
 	printk(KERN_INFO "%s\n", buf);
+
+	strcpy(buf, "TARGETS: ");
+	for (int i = 0; i < MAX_PGTEMP_TARGETS; ++i)
+	{
+		if (targets[i].pid != 0 && targets[i].nr_blocks > 0) {
+			sprintf(buf + strlen(buf), "%d:%d ", targets[i].pid, targets[i].nr_blocks);
+		}
+	}
+	printk(KERN_INFO "%s\n", buf);
+
 	kfree(buf);
 }
 
@@ -218,11 +231,8 @@ static void free_temperature_class(int clsidx, int epoch_id)
 	list_for_each_safe(pos, n, &cls->blocks) {
 		blk = list_entry(pos, struct pg_temp_block, temper_class);
 
-		if ((blk->temper_class.next == LIST_POISON1) ||
-		    (blk->temper_class.prev == LIST_POISON2)) {
-			printk(KERN_INFO "DEBUG: blk %llx %d %llu@%d\n", blk->blocknum,
-								blk->pid, blk->nr_samples_this_epoch_ld, epoch_id);
-		}
+		if (blk->tiering_state != NOT_TIERED)
+			continue;
 
 		list_del(pos);
 		cls->nr_blocks--;
@@ -283,12 +293,11 @@ int pebs_track_epoch_work(int epoch_id)
 		offset &= CONGESTIER_BUF_SHIFT(pebs_buf_pg_order);
 		smp = (struct psample *)(pebs_buffer_data + offset);
 
-		if (smp->is_store)
-			goto skip_this_sample;
-
 		blocknum = smp->addr >> blockshift;
 		pid = smp->pid;
 		period = smp->period;
+		if (smp->is_store)
+			period *= STORE_SAMPLE_MULTIPLIER;
 
 		if (reclaimed_recently(pid))
 			goto skip_this_sample;
@@ -364,12 +373,6 @@ int pebs_track_epoch_work(int epoch_id)
 
 			/* move to new temperature class */
 			if (oldcls != newcls) {
-				if ((blk->temper_class.next == LIST_POISON1) ||
-				    (blk->temper_class.prev == LIST_POISON2)) {
-					printk(KERN_INFO "DEBUG: blk %llx %d (%d->%d) %llu@%d\n", blk->blocknum,
-								pid, oldcls, newcls, blk->nr_samples_this_epoch_ld, epoch_id);
-				}
-
 				mutex_lock(&tmpcls[oldcls].templock);
 				mutex_lock(&tmpcls[newcls].templock);
 				list_move(&blk->temper_class, &tmpcls[newcls].blocks);
@@ -388,7 +391,7 @@ skip_this_sample:
 		scrub_temperature_class(tc, epoch_id);
 	reclaim_dead_targets();
 	free_temperature_class(0, epoch_id);
-	debug_print_temperature_classes();
+	debug_data_structures();
 	printk(KERN_INFO "PEBS epoch %d: (%llu %llu) (%d,%d,%d)\n", 
 				epoch_id, head, tail, newblks,
 				minor_update_blks, major_update_blks);

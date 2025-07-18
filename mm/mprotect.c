@@ -150,17 +150,17 @@ static long change_pte_range(struct mmu_gather *tlb,
 				 * a single-threaded process is running on.
 				 */
 				nid = folio_nid(folio);
-				if (target_node == nid)
-					continue;
+				// if (target_node == nid)
+					// continue;
 				toptier = node_is_toptier(nid);
 
 				/*
 				 * Skip scanning top tier node if normal numa
 				 * balancing is disabled
 				 */
-				if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_NORMAL) &&
-				    toptier)
-					continue;
+				// if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_NORMAL) &&
+				//     toptier)
+				// 	continue;
 				if (folio_use_access_time(folio))
 					folio_xchg_access_time(folio,
 						jiffies_to_msecs(jiffies));
@@ -519,7 +519,11 @@ static long change_protection_range(struct mmu_gather *tlb,
 	unsigned long next;
 	long pages = 0, ret;
 
-	BUG_ON(addr >= end);
+	// BUG_ON(addr >= end);
+	if (addr >= end) {
+		printk(KERN_INFO "BUG: %lx >= %lx\n", addr, end);
+		return 0;
+	}
 	pgd = pgd_offset(mm, addr);
 	tlb_start_vma(tlb, vma);
 	do {

@@ -15,23 +15,27 @@
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 
-int sysctl_promote_pg_epoch = 0;
-int sysctl_epoch_usecs = 1E6; /* 1 second by default */
-int sysctl_tiering_epoch_usecs = 1E6; /* 1 second by default */
+long sysctl_promote_pg_epoch = 0;
+int sysctl_epoch_usecs = 1000000; /* 1 second by default */
+int sysctl_tiering_epoch_usecs = 1000000; /* 1 second by default */
+int sysctl_stale_usecs = 5000000; /* 5 seconds by default */
 enum tiering_mode sysctl_tiering_mode = TIERING_MODE_OFF;
-int sysctl_max_tier_tmpcls = 12;
+int sysctl_max_tier_tmpcls = 62;
 int sysctl_min_tier_tmpcls = 1;
 
 EXPORT_SYMBOL_GPL(sysctl_promote_pg_epoch);
+EXPORT_SYMBOL_GPL(sysctl_epoch_usecs);
+EXPORT_SYMBOL_GPL(sysctl_tiering_epoch_usecs);
 
 static const char *tiering_mode_str[] = {
 	[TIERING_MODE_OFF] = "off",
-	[TIERING_MODE_ON] = "on"
+	[TIERING_MODE_ON] = "on",
+	[TIERING_ON_FALLBACK_NB] = "fallback",
 };
 
 static const char *tiering_interleave_modestr[] = {
 	[TIM_HALF] = "half",
-	[TIM_GSTEP] = "agestep"
+	[TIM_GSTEP] = "agestep",
 };
 
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
@@ -119,7 +123,7 @@ static ssize_t tiering_epoch_msecs_store(struct kobject *kobj,
 	if (err)
 		return err;
 
-	if (msecs < 1 || msecs > 5000) /* 5 seconds max */
+	if (msecs < 1 || msecs > 1E5) /* 5 seconds max */
 		return -EINVAL;
 
 	sysctl_tiering_epoch_usecs = msecs * 1000;
@@ -128,6 +132,31 @@ static ssize_t tiering_epoch_msecs_store(struct kobject *kobj,
 
 static struct kobj_attribute tiering_epoch_msecs_attr =
 		__ATTR_RW(tiering_epoch_msecs);
+
+static ssize_t staleness_msecs_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", sysctl_stale_usecs / 1000);
+}
+
+static ssize_t staleness_msecs_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int err, msecs;
+
+	err = kstrtoint(buf, 0, &msecs);
+	if (err)
+		return err;
+
+	if (msecs < 1 || msecs > 1E5)
+		return -EINVAL;
+
+	sysctl_stale_usecs = msecs * 1000;
+	return count;
+}
+
+static struct kobj_attribute staleness_msecs_attr =
+		__ATTR_RW(staleness_msecs);
 
 static ssize_t tiering_interleave_mode_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
@@ -154,33 +183,6 @@ static ssize_t tiering_interleave_mode_store(struct kobject *kobj,
 
 static struct kobj_attribute tiering_interleave_mode_attr =
 	__ATTR_RW(tiering_interleave_mode);
-
-// static ssize_t tier_frame_pg_order_show(struct kobject *kobj,
-// 		struct kobj_attribute *attr, char *buf)
-// {
-// 	int order = READ_ONCE(tier_frame_pg_order);
-// 	return sysfs_emit(buf, "%d\n", order);
-// }
-
-// static ssize_t tier_frame_pg_order_store(struct kobject *kobj,
-// 		struct kobj_attribute *attr, const char *buf, size_t count)
-// {
-// 	int err, neworder;
-
-// 	err = kstrtoint(buf, 0, &neworder);
-// 	if (err)
-// 		return err;
-
-// 	if (neworder < 0 || neworder > 9)
-// 		return -EINVAL;
-
-// 	WRITE_ONCE(tier_frame_pg_order, neworder);
-
-// 	return count;
-// }
-
-// static struct kobj_attribute tier_frame_pg_order_attr =
-// 	__ATTR_RW(tier_frame_pg_order);
 
 static ssize_t tiering_mode_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
@@ -225,11 +227,23 @@ static ssize_t tiering_mode_store(struct kobject *kobj,
 			return err;
 		WRITE_ONCE(sysctl_tiering_mode, newmode);
 	} else if (!strncmp(buf, "reset", 5)) {
-		if (oldmode == TIERING_MODE_ON) {
+		if (oldmode != TIERING_MODE_OFF) {
 			printk(KERN_ERR "Turn tiering_mode OFF before resetting.\n");
 			return -EPERM;
 		}
 		reset_tiering_ctx();
+	} else if (!strncmp(buf, "fallback", 8)) {
+		newmode = TIERING_ON_FALLBACK_NB;
+
+		if (oldmode == TIERING_ON_FALLBACK_NB)
+			return 2;
+
+		if (oldmode == TIERING_MODE_OFF) {
+			if ((err = tiering_start()))
+				return err;
+		}
+
+		WRITE_ONCE(sysctl_tiering_mode, newmode);
 	} else {
 		return -EINVAL;
 	}
@@ -240,52 +254,56 @@ static ssize_t tiering_mode_store(struct kobject *kobj,
 static struct kobj_attribute tiering_mode_attr =
 		__ATTR_RW(tiering_mode);
 
-static ssize_t epoch_usecs_show(struct kobject *kobj,
+static ssize_t epoch_msecs_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
 	int usecs = READ_ONCE(sysctl_epoch_usecs);
-	return sysfs_emit(buf, "%d\n", usecs);
+	return sysfs_emit(buf, "%d\n", usecs / 1000);
 }
 
-static ssize_t epoch_usecs_store(struct kobject *kobj,
+static ssize_t epoch_msecs_store(struct kobject *kobj,
 		struct kobj_attribute *attr, const char *buf, size_t count)
 {
-	int err, usecs;
+	int err, msecs;
 
-	err = kstrtoint(buf, 0, &usecs);
+	err = kstrtoint(buf, 0, &msecs);
 	if (err)
 		return err;
 
-	if (usecs < 1000 || usecs > 1E8)
+	if (msecs < 1 || msecs > 1E5)
 		return -EINVAL;
 
-	WRITE_ONCE(sysctl_epoch_usecs, usecs);
+	WRITE_ONCE(sysctl_epoch_usecs, msecs * 1000);
 	return count;
 }
 
-static struct kobj_attribute epoch_usecs_attr =
-	__ATTR_RW(epoch_usecs);
+static struct kobj_attribute epoch_msecs_attr =
+	__ATTR_RW(epoch_msecs);
 
-static ssize_t promote_mb_epoch_show(struct kobject *kobj,
+static ssize_t promote_mbps_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%d\n", (sysctl_promote_pg_epoch) / 256);
+	long pages_per_sec = (1000000 * sysctl_promote_pg_epoch) / \
+				(sysctl_tiering_epoch_usecs * 256);
+	return sysfs_emit(buf, "%ld\n", pages_per_sec);
 }
 
-static ssize_t promote_mb_epoch_store(struct kobject *kobj,
+static ssize_t promote_mbps_store(struct kobject *kobj,
 		struct kobj_attribute *attr, const char *buf, size_t count)
 {
 	int err, mbps;
+	long pages_per_sec;
 
 	err = kstrtoint(buf, 0, &mbps);
 	if (err)
 		return err;
 
-	WRITE_ONCE(sysctl_promote_pg_epoch, mbps * 256);
+	pages_per_sec = 256 * (((long)mbps * sysctl_tiering_epoch_usecs) / 1000000);
+	WRITE_ONCE(sysctl_promote_pg_epoch, pages_per_sec);
 	return count;
 }
 
-static struct kobj_attribute promote_mb_epoch_attr = __ATTR_RW(promote_mb_epoch);
+static struct kobj_attribute promote_mbps_attr = __ATTR_RW(promote_mbps);
 
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
 
@@ -448,12 +466,12 @@ static struct kobj_attribute pebs_buf_pg_order_attr =
 #endif /* CONFIG_CONGESTIER_PGTEMP_PEBS */
 
 static struct attribute *congestier_sysfs_attrs[] = {
-	&promote_mb_epoch_attr.attr,
+	&promote_mbps_attr.attr,
 	&tiering_mode_attr.attr,
-	&epoch_usecs_attr.attr,
-	// &tier_frame_pg_order_attr.attr,
+	&epoch_msecs_attr.attr,
 	&tiering_interleave_mode_attr.attr,
 	&tiering_epoch_msecs_attr.attr,
+	&staleness_msecs_attr.attr,
 #ifdef CONFIG_CONGESTIER_PGTEMP_PEBS
 	&pebs_buf_pg_order_attr.attr,
 	&pgtemp_granularity_order_attr.attr,

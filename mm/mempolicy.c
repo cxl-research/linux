@@ -77,6 +77,7 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/congestier.h>
 #include <linux/mempolicy.h>
 #include <linux/pagewalk.h>
 #include <linux/highmem.h>
@@ -2757,6 +2758,7 @@ static void sp_free(struct sp_node *n)
  * Return: NUMA_NO_NODE if the page is in a node that is valid for this
  * policy, or a suitable node ID to allocate a replacement folio from.
  */
+int nextcxlpolnid = 2;
 int mpol_misplaced(struct folio *folio, struct vm_fault *vmf,
 		   unsigned long addr)
 {
@@ -2769,6 +2771,7 @@ int mpol_misplaced(struct folio *folio, struct vm_fault *vmf,
 	int thisnid = numa_node_id();
 	int polnid = NUMA_NO_NODE;
 	int ret = NUMA_NO_NODE;
+	bool numa_migrate = true;
 
 	/*
 	 * Make sure ptl is held so that we don't preempt and we
@@ -2789,8 +2792,10 @@ int mpol_misplaced(struct folio *folio, struct vm_fault *vmf,
 		break;
 
 	case MPOL_PREFERRED:
-		if (node_isset(curnid, pol->nodes))
-			goto out;
+		if (node_isset(curnid, pol->nodes)) {
+			numa_migrate = false;
+			goto congestier;
+		}
 		polnid = first_node(pol->nodes);
 		break;
 
@@ -2816,7 +2821,8 @@ int mpol_misplaced(struct folio *folio, struct vm_fault *vmf,
 			 */
 			if (node_isset(thisnid, pol->nodes))
 				break;
-			goto out;
+			numa_migrate = false;
+			goto congestier;
 		}
 
 		/*
@@ -2824,8 +2830,10 @@ int mpol_misplaced(struct folio *folio, struct vm_fault *vmf,
 		 * else select nearest allowed node, if any.
 		 * If no allowed nodes, use current [!misplaced].
 		 */
-		if (node_isset(curnid, pol->nodes))
-			goto out;
+		if (node_isset(curnid, pol->nodes)) {
+			numa_migrate = false;
+			goto congestier;
+		}
 		z = first_zones_zonelist(
 				node_zonelist(thisnid, GFP_HIGHUSER),
 				gfp_zone(GFP_HIGHUSER),
@@ -2836,17 +2844,25 @@ int mpol_misplaced(struct folio *folio, struct vm_fault *vmf,
 	default:
 		BUG();
 	}
-
+congestier:
 	/* Migrate the folio towards the node whose CPU is referencing it */
 	if (pol->flags & MPOL_F_MORON) {
 		polnid = thisnid;
-
-		if (!should_numa_migrate_memory(current, folio, curnid,
-						thiscpu))
-			goto out;
+		/* If CONGESTIER is running, that sets the polnid */
+		if (READ_ONCE(sysctl_tiering_mode) == TIERING_ON_FALLBACK_NB) {
+			if (READ_ONCE(sysctl_promote_pg_epoch) < 0) {
+				polnid = nextcxlpolnid;
+				nextcxlpolnid = (nextcxlpolnid == 2) ? 3 : 2;
+			}
+			ret = polnid;
+		} else {
+			if (numa_migrate && !should_numa_migrate_memory(current,
+							folio, curnid, thiscpu))
+				goto out;
+		}
 	}
 
-	if (curnid != polnid)
+	if (numa_migrate && (curnid != polnid))
 		ret = polnid;
 out:
 	mpol_cond_put(pol);
