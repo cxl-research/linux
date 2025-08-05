@@ -27,8 +27,6 @@ struct pebs_track_ctx {
 	struct task_struct *task;
 } __tempctx;
 
-#define STORE_SAMPLE_MULTIPLIER 10
-
 static struct pg_temp_target targets[MAX_PGTEMP_TARGETS];
 static pid_t recently_reclaimed_pids[MAX_PGTEMP_TARGETS];
 static int nr_targets = 0;
@@ -297,7 +295,7 @@ int pebs_track_epoch_work(int epoch_id)
 		pid = smp->pid;
 		period = smp->period;
 		if (smp->is_store)
-			period *= STORE_SAMPLE_MULTIPLIER;
+			period *= READ_ONCE(sysctl_store_multiplier);
 
 		if (reclaimed_recently(pid))
 			goto skip_this_sample;

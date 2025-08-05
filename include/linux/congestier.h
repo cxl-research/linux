@@ -83,6 +83,7 @@ extern int sysctl_stale_usecs;
 extern enum tiering_mode sysctl_tiering_mode;
 extern int sysctl_max_tier_tmpcls;
 extern int sysctl_min_tier_tmpcls;
+extern int sysctl_store_multiplier;
 extern enum tiering_interleave_mode tiering_interleave_mode;
 
 static inline int folio_is_not_mapped(struct folio *folio)

@@ -22,6 +22,7 @@ int sysctl_stale_usecs = 5000000; /* 5 seconds by default */
 enum tiering_mode sysctl_tiering_mode = TIERING_MODE_OFF;
 int sysctl_max_tier_tmpcls = 62;
 int sysctl_min_tier_tmpcls = 1;
+int sysctl_store_multiplier = 10;
 
 EXPORT_SYMBOL_GPL(sysctl_promote_pg_epoch);
 EXPORT_SYMBOL_GPL(sysctl_epoch_usecs);
@@ -51,6 +52,31 @@ static const char *pebs_hottrack_state_str[] = {
 };
 
 #endif
+
+static ssize_t store_multiplier_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", sysctl_store_multiplier);
+}
+
+static ssize_t store_multiplier_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int err, multiplier;
+
+	err = kstrtoint(buf, 0, &multiplier);
+	if (err)
+		return err;
+
+	if (multiplier < 1 || multiplier > 65536)
+		return -EINVAL;
+
+	WRITE_ONCE(sysctl_store_multiplier, multiplier);
+	return count;
+}
+
+static struct kobj_attribute store_multiplier_attr =
+		__ATTR_RW(store_multiplier);
 
 static ssize_t max_tier_tmpcls_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
@@ -479,6 +505,7 @@ static struct attribute *congestier_sysfs_attrs[] = {
 #endif
 	&max_tier_tmpcls_attr.attr,
 	&min_tier_tmpcls_attr.attr,
+	&store_multiplier_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(congestier_sysfs);
