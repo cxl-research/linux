@@ -1788,6 +1788,8 @@ static int migrate_pages_batch(struct list_head *from,
 	LIST_HEAD(unmap_folios);
 	LIST_HEAD(dst_folios);
 	bool nosplit = (reason == MR_NUMA_MISPLACED);
+	struct mem_cgroup *memcg;
+	struct lruvec *lruvec;
 
 	VM_WARN_ON_ONCE(mode != MIGRATE_ASYNC &&
 			!list_empty(from) && !list_is_singular(from));
@@ -1922,6 +1924,10 @@ static int migrate_pages_batch(struct list_head *from,
 			case MIGRATEPAGE_SUCCESS:
 				stats->nr_succeeded += nr_pages;
 				stats->nr_thp_succeeded += is_thp;
+				memcg = get_mem_cgroup_from_folio(folio);
+				lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(folio_nid(folio)));
+				if (!node_is_toptier(folio_nid(folio)))
+					mod_lruvec_state(lruvec, PGPROMOTE_SUCCESS, nr_pages);
 				break;
 			case MIGRATEPAGE_UNMAP:
 				list_move_tail(&folio->lru, &unmap_folios);

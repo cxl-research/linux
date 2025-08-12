@@ -47,6 +47,7 @@
 #include <linux/splice.h>
 #include <linux/rcupdate_wait.h>
 #include <linux/sched/mm.h>
+#include <linux/congestier.h>
 #include <asm/pgalloc.h>
 #include <asm/tlbflush.h>
 #include "internal.h"
@@ -1398,7 +1399,9 @@ void migration_entry_wait_on_locked(swp_entry_t entry, spinlock_t *ptl)
 	bool in_thrashing;
 	wait_queue_head_t *q;
 	struct folio *folio = pfn_swap_entry_folio(entry);
+	u64 start_time, end_time;
 
+	start_time = ktime_get_ns();
 	q = folio_waitqueue(folio);
 	if (!folio_test_uptodate(folio) && folio_test_workingset(folio)) {
 		delayacct_thrashing_start(&in_thrashing);
@@ -1448,6 +1451,8 @@ void migration_entry_wait_on_locked(swp_entry_t entry, spinlock_t *ptl)
 		delayacct_thrashing_end(&in_thrashing);
 		psi_memstall_leave(&pflags);
 	}
+	end_time = ktime_get_ns();
+	congestier_account_wtime((end_time - start_time));
 }
 #endif
 

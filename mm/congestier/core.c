@@ -38,6 +38,17 @@ static int TIER_TEMPCLS_MIN = 1;
 
 static int epochid = 0;
 static int next_tiering_epoch = 0;
+static u64 migr_wtime = 0;
+
+void congestier_account_wtime(u64 wtimens)
+{
+	migr_wtime += wtimens;
+}
+
+static void ewma_update_wtime(void)
+{
+	migr_wtime /= 2;
+}
 
 static bool tiering_need_stop(void)
 {
@@ -747,8 +758,11 @@ static int tiering_fn(void *data)
 end_epoch:
 		end = ktime_get_ns();
 		dur_usecs = (end - start) / 1000;
-		printk(KERN_INFO "Tiering epoch %d took %llu usecs, migrated %d+%d KB\n",
-					epochid, dur_usecs, migrated * 4, fallback_migrated * 4);
+		ewma_update_wtime();
+		printk(KERN_INFO
+		       "Tiering epoch %d took %llu usecs, migrated %d+%d KB (wtime_ewma=%llu)\n",
+		       epochid, dur_usecs, migrated * 4, fallback_migrated * 4, 
+					 READ_ONCE(migr_wtime));
 		++epochid;
 
 		printk(KERN_INFO "----------\n");

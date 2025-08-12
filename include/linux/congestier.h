@@ -131,6 +131,7 @@ struct temperature_class *get_temp_cls(int idx);
 int temp_class(uint64_t temp);
 void reset_pebs_tracking(void);
 int set_demotion_level(struct pg_temp_block *blk);
+void congestier_account_wtime(u64 wtimens);
 
 #endif /* CONFIG_CONGESTIER_PGTEMP_PEBS */
 
