@@ -236,68 +236,68 @@ struct tiering_pgwalk_private {
 
 static unsigned int congestier_promote_pages(struct list_head *folios)
 {
-	unsigned int nr_migrated = 0, ret;
+	unsigned int nr_migrated = 0, migrated;
+	int nr_remaining;
 	nodemask_t allowed_mask = NODE_MASK_NONE;
+	struct folio *folio;
 	struct migration_target_control mtc = {
 		.gfp_mask = GFP_HIGHUSER_MOVABLE,
 		.nid = 1, /* DRAM NID */
 		.nmask = &allowed_mask
 	};
+	LIST_HEAD(migrate_list);
 
 	if (list_empty(folios))
 		return 0;
 
-	ret = congestier_migrate_pages(folios, alloc_migrate_folio, NULL,
-		      (unsigned long)&mtc, MIGRATE_ASYNC, MR_CONGESTIER,
-		      &nr_migrated);
+	while (!list_empty(folios)) {
+		folio = lru_to_folio(folios);
+		list_move(&folio->lru, &migrate_list);
+		nr_remaining = congestier_migrate_pages(&migrate_list,
+											alloc_migrate_folio, NULL,
+											(unsigned long)&mtc, MIGRATE_ASYNC,
+											MR_CONGESTIER, &migrated);
+		if (nr_remaining && !list_empty(&migrate_list))
+			putback_movable_pages(&migrate_list);
+		nr_migrated += migrated;
+	}
+
 	return nr_migrated;
 }
 
 static unsigned int congestier_demote_pages(struct list_head *folios)
 {
+	unsigned int nr_migrated = 0, migrated, mtcidx = 0;
+	int nr_remaining;
 	nodemask_t allowed_mask = NODE_MASK_NONE;
-	struct migration_target_control mtc2, mtc3;
-	struct list_head *mid, *tmp;
-	int ret2, ret3;
-	unsigned int nlist = 0, nr_migr_2, nr_migr_3, n1 = 0, n2 = 0;
-	gfp_t gfp = GFP_HIGHUSER_MOVABLE;
-	LIST_HEAD(fol2);
-	LIST_HEAD(fol3);
+	struct folio *folio;
+	struct migration_target_control mtc[2];
+	LIST_HEAD(migrate_list);
 
 	if (list_empty(folios))
 		return 0;
 
-	mtc2.gfp_mask = gfp;
-	mtc2.nid = 2;
-	mtc2.nmask = &allowed_mask;
+	mtc[0].gfp_mask = GFP_HIGHUSER_MOVABLE;
+	mtc[1].gfp_mask = GFP_HIGHUSER_MOVABLE;
+	mtc[0].nid = 2;
+	mtc[1].nid = 3;
+	mtc[0].nmask = &allowed_mask;
+	mtc[1].nmask = &allowed_mask;
 
-	mtc3.gfp_mask = gfp;
-	mtc3.nid = 3;
-	mtc3.nmask = &allowed_mask;
+	while (!list_empty(folios)) {
+		folio = lru_to_folio(folios);
+		list_move(&folio->lru, &migrate_list);
+		nr_remaining = congestier_migrate_pages(&migrate_list,
+											alloc_migrate_folio, NULL,
+											(unsigned long)&mtc[mtcidx], MIGRATE_ASYNC,
+											MR_CONGESTIER, &migrated);
+		if (nr_remaining && !list_empty(&migrate_list))
+			putback_movable_pages(&migrate_list);
+		mtcidx = ((mtcidx + 1) % 2);
+		nr_migrated += migrated;
+	}
 
-	list_for_each(mid, folios)
-		nlist++;
-	nlist /= 2;
-
-	mid = folios;
-	while (nlist--)
-		mid = mid->next;
-
-	list_cut_position(&fol2, folios, mid);
-	list_splice_tail_init(folios, &fol3);
-
-	list_for_each(tmp, &fol2)
-		n1++;
-	list_for_each(tmp, &fol3)
-		n2++;
-
-	ret2 = congestier_migrate_pages(&fol2, alloc_migrate_folio, NULL,
-															(unsigned long)&mtc2, MIGRATE_ASYNC,
-															MR_CONGESTIER, &nr_migr_2);
-	ret3 = congestier_migrate_pages(&fol3, alloc_migrate_folio, NULL,
-															(unsigned long)&mtc3, MIGRATE_ASYNC,
-															MR_CONGESTIER, &nr_migr_3);
-	return (nr_migr_2 + nr_migr_3);
+	return nr_migrated;
 }
 
 static unsigned int congestier_migrate_folios(struct list_head *folios,
@@ -386,6 +386,7 @@ static int do_tiering(void)
 		return 0;
 	if (numpages < 0)
 		numpages *= -1;
+	// return 0; /* all by fallback */
 
 	if (!tierinfo.tier_promote) {
 		tier_head = &__tierctx.dram_cands;
