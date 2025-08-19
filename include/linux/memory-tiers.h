@@ -78,6 +78,11 @@ struct memory_tier *__node_get_memory_tier(int node);
 int next_demotion_node(int node);
 void node_get_allowed_targets(pg_data_t *pgdat, nodemask_t *targets);
 bool node_is_toptier(int node);
+
+#ifdef CONFIG_NUMA_BALANCING
+extern unsigned int sysctl_numa_balancing_promote_rate_limit;
+#endif /* CONFIG_NUMA_BALANCING */
+
 #else
 static inline int next_demotion_node(int node)
 {

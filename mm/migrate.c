@@ -2676,6 +2676,43 @@ int migrate_misplaced_folio_prepare(struct folio *folio,
 	return 0;
 }
 
+unsigned long colloid_rl_cand = 0;
+unsigned int colloid_rl_start = 0;
+unsigned long colloid_cand = 0;
+
+#ifdef CONFIG_NUMA_BALANCING
+static bool colloid_promotion_rate_limit(int nr)
+{
+	unsigned long nr_cand_old, nr_cand, rate_limit;
+	unsigned int now, start;
+
+	rate_limit = sysctl_numa_balancing_promote_rate_limit;
+	now = jiffies_to_msecs(jiffies);
+	do {
+		nr_cand_old = colloid_cand;
+		nr_cand = nr_cand_old + nr;
+	} while (cmpxchg(&colloid_cand, nr_cand_old, nr_cand) != nr_cand_old);
+
+	start = colloid_rl_start;
+	if (now - start > MSEC_PER_SEC &&
+			cmpxchg(&colloid_rl_start, start, now) == start)
+		colloid_rl_cand = nr_cand;
+
+	if (nr_cand - colloid_rl_cand >= rate_limit)
+		return true;
+	return false;
+}
+#else
+static bool colloid_promotion_rate_limit(int nr)
+{
+	/*
+	 * If NUMA balancing is not enabled, we do not rate limit
+	 * promotion of pages.
+	 */
+	return false;
+}
+#endif /* CONFIG_NUMA_BALANCING */
+
 /*
  * Attempt to migrate a misplaced folio to the specified destination
  * node. Caller is expected to have isolated the folio by calling
@@ -2687,16 +2724,18 @@ int migrate_misplaced_folio(struct folio *folio, struct vm_area_struct *vma,
 			    int node)
 {
 	pg_data_t *pgdat = NODE_DATA(node);
-	int nr_remaining;
-	unsigned int nr_succeeded;
+	int nr_remaining = 1;
+	unsigned int nr_succeeded = 0;
 	LIST_HEAD(migratepages);
 	struct mem_cgroup *memcg = get_mem_cgroup_from_folio(folio);
 	struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
 
 	list_add(&folio->lru, &migratepages);
-	nr_remaining = migrate_pages(&migratepages, alloc_misplaced_dst_folio,
-				     NULL, node, MIGRATE_ASYNC,
-				     MR_NUMA_MISPLACED, &nr_succeeded);
+	if (!colloid_promotion_rate_limit(folio_nr_pages(folio)))
+		nr_remaining = migrate_pages(&migratepages, alloc_misplaced_dst_folio,
+					     NULL, node, MIGRATE_ASYNC,
+					     MR_NUMA_MISPLACED, &nr_succeeded);
+
 	if (nr_remaining && !list_empty(&migratepages))
 		putback_movable_pages(&migratepages);
 	if (nr_succeeded) {

@@ -128,7 +128,7 @@ static unsigned int sysctl_sched_cfs_bandwidth_slice		= 5000UL;
 
 #ifdef CONFIG_NUMA_BALANCING
 /* Restrict the NUMA promotion throughput (MB/s) for each target node. */
-static unsigned int sysctl_numa_balancing_promote_rate_limit = 65536;
+unsigned int sysctl_numa_balancing_promote_rate_limit = 65536;
 #endif
 
 #ifdef CONFIG_SYSCTL
@@ -1858,20 +1858,45 @@ static int numa_hint_fault_latency(struct folio *folio)
  * hurt application latency.  So we provide a mechanism to rate limit
  * the number of pages that are tried to be promoted.
  */
-static bool numa_promotion_rate_limit(struct pglist_data *pgdat,
-				      unsigned long rate_limit, int nr)
+// static bool numa_promotion_rate_limit(struct pglist_data *pgdat,
+// 				      unsigned long rate_limit, int nr)
+// {
+// 	unsigned long nr_cand;
+// 	unsigned int now, start;
+
+// 	now = jiffies_to_msecs(jiffies);
+// 	mod_node_page_state(pgdat, PGPROMOTE_CANDIDATE, nr);
+// 	nr_cand = node_page_state(pgdat, PGPROMOTE_CANDIDATE);
+// 	start = pgdat->nbp_rl_start;
+// 	if (now - start > MSEC_PER_SEC &&
+// 	    cmpxchg(&pgdat->nbp_rl_start, start, now) == start)
+// 		pgdat->nbp_rl_nr_cand = nr_cand;
+// 	if (nr_cand - pgdat->nbp_rl_nr_cand >= rate_limit)
+// 		return true;
+// 	return false;
+// }
+
+static unsigned long colloid_rl_cand = 0;
+static unsigned int colloid_rl_start = 0;
+static unsigned long colloid_cand = 0;
+
+static bool colloid_promotion_rate_limit(unsigned long rate_limit, int nr)
 {
-	unsigned long nr_cand;
+	unsigned long nr_cand_old, nr_cand;
 	unsigned int now, start;
 
 	now = jiffies_to_msecs(jiffies);
-	mod_node_page_state(pgdat, PGPROMOTE_CANDIDATE, nr);
-	nr_cand = node_page_state(pgdat, PGPROMOTE_CANDIDATE);
-	start = pgdat->nbp_rl_start;
+	do {
+		nr_cand_old = colloid_cand;
+		nr_cand = nr_cand_old + nr;
+	} while (cmpxchg(&colloid_cand, nr_cand_old, nr_cand) != nr_cand_old);
+
+	start = colloid_rl_start;
 	if (now - start > MSEC_PER_SEC &&
-	    cmpxchg(&pgdat->nbp_rl_start, start, now) == start)
-		pgdat->nbp_rl_nr_cand = nr_cand;
-	if (nr_cand - pgdat->nbp_rl_nr_cand >= rate_limit)
+			cmpxchg(&colloid_rl_start, start, now) == start)
+		colloid_rl_cand = nr_cand;
+
+	if (nr_cand - colloid_rl_cand >= rate_limit)
 		return true;
 	return false;
 }
@@ -1907,15 +1932,17 @@ static void numa_promotion_adjust_threshold(struct pglist_data *pgdat,
 
 static bool can_migrate_colloid(int src_nid, int dst_nid)
 {
-	if (READ_ONCE(colloid_local_lat_gt_remote)) {
-		/* check for potential DRAM->CXL migration */
-		if (src_nid == READ_ONCE(colloid_nid_of_interest))
-			return true;
-	} else {
-		/* check for potential CXL->DRAM migration */
-		if (dst_nid == READ_ONCE(colloid_nid_of_interest) &&
-				!node_is_toptier(src_nid))
-			return true;
+	if (sysctl_numa_balancing_mode & NUMA_BALANCING_COLLOID) {
+		if (READ_ONCE(colloid_local_lat_gt_remote)) {
+			/* check for potential DRAM->CXL migration */
+			if (src_nid == READ_ONCE(colloid_nid_of_interest))
+				return true;
+		} else {
+			/* check for potential CXL->DRAM migration */
+			if (dst_nid == READ_ONCE(colloid_nid_of_interest) &&
+					!node_is_toptier(src_nid))
+				return true;
+		}
 	}
 	return false;
 }
@@ -1960,10 +1987,8 @@ bool should_numa_migrate_memory(struct task_struct *p, struct folio *folio,
 			return false;
 
 colloid_migrate_check:
-		if (sysctl_numa_balancing_mode & NUMA_BALANCING_COLLOID)
-			return can_migrate_colloid(src_nid, dst_nid);
-		return !numa_promotion_rate_limit(pgdat, rate_limit,
-								folio_nr_pages(folio));
+		return can_migrate_colloid(src_nid, dst_nid) && 
+				!colloid_promotion_rate_limit(rate_limit, folio_nr_pages(folio));
 	}
 
 	/* The code below was originally intended for Normal NUMA
