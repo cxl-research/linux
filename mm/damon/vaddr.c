@@ -9,12 +9,14 @@
 
 #include <linux/highmem.h>
 #include <linux/hugetlb.h>
+#include <linux/migrate.h>
 #include <linux/mman.h>
 #include <linux/mmu_notifier.h>
 #include <linux/page_idle.h>
 #include <linux/pagewalk.h>
 #include <linux/sched/mm.h>
 
+#include "../internal.h"
 #include "ops-common.h"
 
 #ifdef CONFIG_DAMON_VADDR_KUNIT_TEST
@@ -653,6 +655,205 @@ static unsigned long damos_madvise(struct damon_target *target,
 }
 #endif	/* CONFIG_ADVISE_SYSCALLS */
 
+struct damos_migrate_args {
+	struct list_head folios;
+	bool do_promote;
+};
+
+static int damon_add_to_migrate_list(pte_t *pte, unsigned long addr,
+		unsigned long next, struct mm_walk *walk)
+{
+	struct folio *folio;
+	struct damos_migrate_args *args = walk->private;
+	int src_nid, ret = 0;
+
+	if (!pte_present(ptep_get(pte)))
+		return 0;
+
+	folio = damon_get_folio(pte_pfn(ptep_get(pte)));
+	if (!folio)
+		return 0;
+
+	/* are we on the correct node ? */
+	src_nid = folio_nid(folio);
+	if ((args->do_promote && !COLLOID_CXL_NID(src_nid)) ||
+			(!args->do_promote && !COLLOID_DRAM_NID(src_nid))) {
+		ret = -EINVAL;
+		goto put_folio;
+	}
+
+	if (!folio_isolate_lru(folio))
+		goto put_folio;
+
+	list_add(&folio->lru, &args->folios);
+
+put_folio:
+	folio_put(folio);
+	return ret;
+}
+
+static const struct mm_walk_ops colloid_migr_ops = {
+	.pte_entry = damon_add_to_migrate_list,
+	.walk_lock = PGWALK_RDLOCK,
+};
+
+static unsigned int colloid_promote_folios(struct list_head *folios)
+{
+	unsigned int nr_succeeded;
+	struct folio *folio;
+	nodemask_t allowed_mask = NODE_MASK_NONE;
+	struct migration_target_control mtc = {
+		.gfp_mask = (GFP_HIGHUSER_MOVABLE & ~__GFP_RECLAIM) |
+				__GFP_NOWARN | __GFP_NOMEMALLOC | GFP_NOWAIT,
+		.nid = 1,
+		.nmask = &allowed_mask,
+	};
+	LIST_HEAD(migrate_folios);
+	LIST_HEAD(ret_folios);
+
+	while (!list_empty(folios)) {
+		cond_resched();
+
+		folio = lru_to_folio(folios);
+		list_del(&folio->lru);
+
+		if (!folio_trylock(folio))
+			goto keep;
+
+		list_add(&folio->lru, &migrate_folios);
+		folio_unlock(folio);
+		continue;
+keep:
+		list_add(&folio->lru, &ret_folios);
+	}
+
+	migrate_pages(&migrate_folios, alloc_migrate_folio, NULL,
+						(unsigned long)&mtc, MIGRATE_ASYNC, MR_DAMON, 
+						&nr_succeeded);
+
+	if (!list_empty(&migrate_folios))
+		list_splice(&migrate_folios, folios);
+
+	try_to_unmap_flush();
+
+	list_splice(&ret_folios, folios);
+
+	while (!list_empty(folios)) {
+		folio = lru_to_folio(folios);
+		list_del(&folio->lru);
+		folio_putback_lru(folio);
+	}
+
+	return nr_succeeded;
+}
+
+static unsigned int colloid_demote_folios(struct list_head *folios)
+{
+	unsigned int nr_succeeded, nr2, nr3;
+	struct folio *folio;
+	nodemask_t allowed_mask = NODE_MASK_NONE;
+	struct migration_target_control mtc2, mtc3;
+	int dst_nid = 2;
+	LIST_HEAD(migrate_folios_2);
+	LIST_HEAD(migrate_folios_3);
+	LIST_HEAD(ret_folios);
+
+	mtc2.gfp_mask = (GFP_HIGHUSER_MOVABLE & ~__GFP_RECLAIM) |
+			    __GFP_NOWARN | __GFP_NOMEMALLOC | GFP_NOWAIT;
+	mtc2.nid = 2;
+	mtc2.nmask = &allowed_mask;
+
+	mtc3.gfp_mask = (GFP_HIGHUSER_MOVABLE & ~__GFP_RECLAIM) |
+			    __GFP_NOWARN | __GFP_NOMEMALLOC | GFP_NOWAIT;
+	mtc3.nid = 3;
+	mtc3.nmask = &allowed_mask;
+
+	while (!list_empty(folios)) {
+		cond_resched();
+
+		folio = lru_to_folio(folios);
+		list_del(&folio->lru);
+
+		if (!folio_trylock(folio))
+			goto keep;
+
+		if (dst_nid == 2) {
+			list_add(&folio->lru, &migrate_folios_2);
+			dst_nid = 3;
+		} else {
+			list_add(&folio->lru, &migrate_folios_3);
+			dst_nid = 2;
+		}
+		folio_unlock(folio);
+		continue;
+keep:
+		list_add(&folio->lru, &ret_folios);
+	}
+
+	migrate_pages(&migrate_folios_2, alloc_migrate_folio, NULL,
+						(unsigned long)&mtc2, MIGRATE_ASYNC, MR_DAMON, &nr2);
+	migrate_pages(&migrate_folios_3, alloc_migrate_folio, NULL,
+						(unsigned long)&mtc3, MIGRATE_ASYNC, MR_DAMON, &nr3);
+	nr_succeeded = nr2 + nr3;
+
+	if (!list_empty(&migrate_folios_2))
+		list_splice(&migrate_folios_2, folios);
+	if (!list_empty(&migrate_folios_3))
+		list_splice(&migrate_folios_3, folios);
+
+	try_to_unmap_flush();
+
+	list_splice(&ret_folios, folios);
+
+	while (!list_empty(folios)) {
+		folio = lru_to_folio(folios);
+		list_del(&folio->lru);
+		folio_putback_lru(folio);
+	}
+
+	return nr_succeeded;
+}
+
+static unsigned long damos_colloid(struct damon_target *target,
+		struct damon_region *region, struct damos *scheme)
+{
+	struct damos_migrate_args args;
+	struct mm_struct *mm = damon_get_mm(target);
+	struct damos_quota *quota = &scheme->quota;
+	struct damos_quota_goal *goal;
+	unsigned long start = PAGE_ALIGN(region->ar.start);
+	unsigned long len = PAGE_ALIGN(damon_sz_region(region));
+	unsigned int migrated_pages;
+	int colloid_multiplier = 0;
+	LIST_HEAD(f2);
+	LIST_HEAD(f3);
+
+	if (!mm || list_empty(&quota->goals))
+		return 0;
+
+	damos_for_each_quota_goal(goal, quota) {
+		colloid_multiplier += goal->colloid_multiplier;
+	}
+
+	if (!colloid_multiplier)
+		return 0;
+
+	args.do_promote = (colloid_multiplier > 0);
+	INIT_LIST_HEAD(&args.folios);
+
+	mmap_read_lock(mm);
+	walk_page_range(mm, start, start + len, &colloid_migr_ops, &args);
+	mmap_read_unlock(mm);
+	mmput(mm);
+
+	if (args.do_promote)
+		migrated_pages = colloid_promote_folios(&args.folios);
+	else
+		migrated_pages = colloid_demote_folios(&args.folios);
+
+	return migrated_pages * PAGE_SIZE;
+}
+
 static unsigned long damon_va_apply_scheme(struct damon_ctx *ctx,
 		struct damon_target *t, struct damon_region *r,
 		struct damos *scheme, unsigned long *sz_filter_passed)
@@ -677,6 +878,8 @@ static unsigned long damon_va_apply_scheme(struct damon_ctx *ctx,
 		break;
 	case DAMOS_STAT:
 		return 0;
+	case DAMOS_COLLOID:
+		return damos_colloid(t, r, scheme);
 	default:
 		/*
 		 * DAMOS actions that are not yet supported by 'vaddr'.
@@ -695,6 +898,8 @@ static int damon_va_scheme_score(struct damon_ctx *context,
 	switch (scheme->action) {
 	case DAMOS_PAGEOUT:
 		return damon_cold_score(context, r, scheme);
+	case DAMOS_COLLOID:
+		return damon_hot_score(context, r, scheme);
 	default:
 		break;
 	}

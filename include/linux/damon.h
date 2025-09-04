@@ -19,6 +19,9 @@
 /* Max priority score for DAMON-based operation schemes */
 #define DAMOS_MAX_SCORE		(99)
 
+#define COLLOID_CXL_NID(nid)		((nid) > 1)
+#define COLLOID_DRAM_NID(nid)		((nid) == 1)
+
 /* Get a random number in [l, r) */
 static inline unsigned long damon_rand(unsigned long l, unsigned long r)
 {
@@ -108,6 +111,8 @@ struct damon_target {
  * @DAMOS_MIGRATE_HOT:  Migrate the regions prioritizing warmer regions.
  * @DAMOS_MIGRATE_COLD:	Migrate the regions prioritizing colder regions.
  * @DAMOS_STAT:		Do nothing but count the stat.
+ * @DAMOS_COLLOID:	Apply colloid action.
+ *
  * @NR_DAMOS_ACTIONS:	Total number of DAMOS actions
  *
  * The support of each action is up to running &struct damon_operations.
@@ -127,6 +132,7 @@ enum damos_action {
 	DAMOS_MIGRATE_HOT,
 	DAMOS_MIGRATE_COLD,
 	DAMOS_STAT,		/* Do nothing but only record the stat */
+	DAMOS_COLLOID,
 	NR_DAMOS_ACTIONS,
 };
 
@@ -135,6 +141,7 @@ enum damos_action {
  *
  * @DAMOS_QUOTA_USER_INPUT:	User-input value.
  * @DAMOS_QUOTA_SOME_MEM_PSI_US:	System level some memory PSI in us.
+ * @DAMOS_QUOTA_COLLOID_METRIC:	Colloid metric.
  * @NR_DAMOS_QUOTA_GOAL_METRICS:	Number of DAMOS quota goal metrics.
  *
  * Metrics equal to larger than @NR_DAMOS_QUOTA_GOAL_METRICS are unsupported.
@@ -142,6 +149,7 @@ enum damos_action {
 enum damos_quota_goal_metric {
 	DAMOS_QUOTA_USER_INPUT,
 	DAMOS_QUOTA_SOME_MEM_PSI_US,
+	DAMOS_QUOTA_COLLOID_METRIC,
 	NR_DAMOS_QUOTA_GOAL_METRICS,
 };
 
@@ -151,6 +159,7 @@ enum damos_quota_goal_metric {
  * @target_value:	Target value of @metric to achieve with the tuning.
  * @current_value:	Current value of @metric.
  * @last_psi_total:	Last measured total PSI
+ * @colloid_multiplier:	Colloid multiplier (10000 / (targetp - p))
  * @list:		List head for siblings.
  *
  * Data structure for getting the current score of the quota tuning goal.  The
@@ -169,6 +178,7 @@ struct damos_quota_goal {
 	/* metric-dependent fields */
 	union {
 		u64 last_psi_total;
+		int colloid_multiplier;
 	};
 	struct list_head list;
 };
@@ -728,6 +738,12 @@ struct damon_ctx {
 	struct list_head adaptive_targets;
 	struct list_head schemes;
 };
+
+/* Fetch Colloid Multiplier from Module */
+typedef int (*get_colloid_multiplier_t)(void);
+void register_colloid_source(get_colloid_multiplier_t fn);
+void unregister_colloid_source(void);
+int damos_get_colloid_multiplier(void);
 
 static inline struct damon_region *damon_next_region(struct damon_region *r)
 {

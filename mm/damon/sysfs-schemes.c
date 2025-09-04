@@ -849,6 +849,7 @@ struct damos_sysfs_quota_goal {
 static const char * const damos_sysfs_quota_goal_metric_strs[] = {
 	"user_input",
 	"some_mem_psi_us",
+	"colloid_multiplier",
 };
 
 static struct damos_sysfs_quota_goal *damos_sysfs_quota_goal_alloc(void)
@@ -1473,6 +1474,7 @@ static const char * const damon_sysfs_damos_action_strs[] = {
 	"migrate_hot",
 	"migrate_cold",
 	"stat",
+	"colloid",
 };
 
 static struct damon_sysfs_scheme *damon_sysfs_scheme_alloc(

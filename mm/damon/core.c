@@ -1699,6 +1699,26 @@ static inline u64 damos_get_some_mem_psi_total(void)
 
 #endif	/* CONFIG_PSI */
 
+static get_colloid_multiplier_t colloid_multiplier_fn;
+
+void register_colloid_source(get_colloid_multiplier_t fn)
+{
+	WRITE_ONCE(colloid_multiplier_fn, fn);
+}
+EXPORT_SYMBOL_GPL(register_colloid_source);
+
+void unregister_colloid_source(void)
+{
+	WRITE_ONCE(colloid_multiplier_fn, NULL);
+}
+EXPORT_SYMBOL_GPL(unregister_colloid_source);
+
+int damos_get_colloid_multiplier(void)
+{
+	get_colloid_multiplier_t fn = READ_ONCE(colloid_multiplier_fn);
+	return fn ? fn() : 0;
+}
+
 static void damos_set_quota_goal_current_value(struct damos_quota_goal *goal)
 {
 	u64 now_psi_total;
@@ -1711,6 +1731,11 @@ static void damos_set_quota_goal_current_value(struct damos_quota_goal *goal)
 		now_psi_total = damos_get_some_mem_psi_total();
 		goal->current_value = now_psi_total - goal->last_psi_total;
 		goal->last_psi_total = now_psi_total;
+		break;
+	case DAMOS_QUOTA_COLLOID_METRIC:
+		goal->current_value = 100;
+		goal->target_value = 100;
+		goal->colloid_multiplier = damos_get_colloid_multiplier();
 		break;
 	default:
 		break;
@@ -1764,7 +1789,7 @@ static void damos_set_effective_quota(struct damos_quota *quota)
 		esz = min(throughput * quota->ms, esz);
 	}
 
-	if (quota->sz && quota->sz < esz)
+	if (quota->sz && quota->sz > esz)
 		esz = quota->sz;
 
 	quota->esz = esz;
