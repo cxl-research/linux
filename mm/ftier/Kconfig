@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+menu "FTier Memory Tiering Support"
+
+config FTIER
+	bool "FTier Memory Tiering Support"
+	help
+		Enables memory tiering between DRAM and CXL memory.
+
+choice
+	prompt "FTIER Mode of Operation"
+	depends on FTIER
+	default FTIER_TRACK_TEMP
+	help
+		Choose the mode of operation for FTier memory tiering.
+		Default is to track temperature only.
+
+config FTIER_TRACK_TEMP
+	bool "Track Temperature Only"
+	help
+		FTier will use metadata from upper-level Page Table Entries
+		to track memory temperature.
+
+config FTIER_TIER_MEM
+	bool "Tier Memory"
+	help
+		FTier will promote hot pages to lower-latency tier.
+
+endchoice
+
+endmenu
