@@ -7,9 +7,10 @@
  */
 
 #include <linux/ftier.h>
+#include <linux/mutex.h>
 
 enum ftier_status sysctl_ftier_status = FTIER_STATUS_OFF;
-unsigned int sysctl_fscan_period_ms = 1000;
+unsigned int sysctl_fscan_period_ms = 10000; /* 10s */
 static DEFINE_MUTEX(ftier_sysctl_lock);
 
 static const char *ftier_status_strs[] = {

@@ -8,13 +8,9 @@
 
 #include <linux/delay.h>
 #include <linux/fs.h>
-#include <linux/kthread.h>
-#include <linux/ktime.h>
 #include <linux/migrate.h>
 #include <linux/mm.h>
 #include <linux/mmu_notifier.h>
-#include <linux/mutex.h>
-#include <linux/pagewalk.h>
 #include <linux/types.h>
 
 /* Machine specific */
@@ -36,8 +32,19 @@ enum ftier_status {
 	NR_FTIER_STATUSES,
 };
 
+struct fhot_meta_gb {
+	pud_t *pud;
+	unsigned long address;
+	unsigned int fspin_period_us;
+	unsigned int nr_mapped;
+	struct list_head siblings;
+	// unsigned char accesses[512];
+};
+
 struct ftier_target {
 	pid_t pid;
+	struct list_head fhot_list;
+	unsigned int nr_fhot;
 };
 
 struct ftier_ctx {
