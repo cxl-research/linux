@@ -18,6 +18,7 @@ struct ftier_ctx __ctx = {
 		.pid = -1,
 		.fhot_list = LIST_HEAD_INIT(__ctx.target.fhot_list),
 		.nr_fhot = 0,
+		.wq = NULL,
 	},
 };
 
@@ -31,6 +32,7 @@ const unsigned int fspin_period_us_array[] = {
 #define MIN_FSPIN_PERIOD_US (fspin_period_us_array[0])
 #define MAX_FSPIN_PERIOD_US \
 		(fspin_period_us_array[ARRAY_SIZE(fspin_period_us_array) - 1])
+#define MAX_SPINS 255 /* max(unsigned char) */
 
 static inline int incr_ftier_period_us(unsigned int us)
 {
@@ -108,6 +110,11 @@ static struct mm_struct *get_target_mm(void)
 	return mm;
 }
 
+static inline void reset_accesses(struct fhot_meta_gb *meta)
+{
+	memset(meta->accesses, 0, sizeof(meta->accesses));
+}
+
 static struct fhot_meta_gb * find_fhot_meta(unsigned long addr)
 {
 	struct fhot_meta_gb *meta;
@@ -122,14 +129,13 @@ static void alloc_fhot_meta(pud_t *pud, unsigned long addr)
 {
 	struct fhot_meta_gb *meta;
 
-	meta = kmalloc(sizeof(*meta), GFP_KERNEL);
+	meta = kzalloc(sizeof(*meta), GFP_KERNEL);
 	if (!meta)
 		return;
 
 	meta->pud = pud;
 	meta->address = addr & PUD_MASK;
-	meta->fspin_period_us = 10000; /* 10ms */
-	meta->nr_mapped = 0;
+	meta->fspin_period_us = 20000; /* 20ms */
 	INIT_LIST_HEAD(&meta->siblings);
 	list_add(&meta->siblings, &__ctx.target.fhot_list);
 	__ctx.target.nr_fhot++;
@@ -162,8 +168,11 @@ static int fscan(pud_t *pud, unsigned long addr,
 		if (!(priv->pudmap[(index >> 6)] & mask)) {
 			priv->count++;
 			priv->pudmap[(index >> 6)] |= mask;
-			if (!find_fhot_meta(addr))
+			meta = find_fhot_meta(addr);
+			if (!meta)
 				alloc_fhot_meta(pud, addr);
+			else
+				reset_accesses(meta);
 		}
 	} else if (!(priv->pudmap[(index >> 6)] & mask)) {
 		meta = find_fhot_meta(addr);
@@ -221,23 +230,36 @@ static void count_mapped_entries(struct mm_struct *mm,
 	meta->nr_mapped = nr_mapped;
 }
 
-static void tune_fspin_period(struct mm_struct *mm,
-			struct fhot_meta_gb *meta)
+struct fspin_args {
+	struct work_struct work;
+	struct mm_struct *mm;
+	struct fhot_meta_gb *meta;
+};
+
+static void fspin(struct work_struct *work_args)
 {
-	pud_t *pud = meta->pud;
+	pud_t *pud;
 	pmd_t *pmd;
-	unsigned long addr, next, end;
+	struct mm_struct *mm;
+	struct fhot_meta_gb *meta;
+	struct fspin_args *args;
+	unsigned long addr, next, end, pmd_idx;
 	uint64_t start_ns, end_ns;
-	unsigned int fspin_period_us, dur_us, remaining_tries = 5;
-	unsigned int min_hot, max_hot, nr_hot;
-	bool first_iter = true, incr_period = false, decr_period = false;
+	unsigned int min_hot, max_hot, dur_us, dur_sum_us, nr_spins;
+	unsigned int fspin_period_us, nr_hot, sum_hot, remain_spin_us;
 
-	if (meta->nr_mapped < 5)
-		return;
+	args = container_of(work_args, struct fspin_args, work);
+	mm = args->mm;
+	meta = args->meta;
 
-	fspin_period_us = meta->fspin_period_us;
+	pud = meta->pud;
 	min_hot = 4 * meta->nr_mapped / 10;
 	max_hot = 6 * meta->nr_mapped / 10;
+	remain_spin_us = sysctl_fspin_ms * 1000;
+	fspin_period_us = meta->fspin_period_us;
+	dur_sum_us = 0;
+	nr_spins = 0;
+	sum_hot = 0;
 
 	do {
 		nr_hot = 0;
@@ -251,56 +273,56 @@ static void tune_fspin_period(struct mm_struct *mm,
 			if (!pmd_present(*pmd))
 				continue;
 
-			if (pmdp_test_and_clear_young(NULL, addr, pmd))
+			if (pmdp_test_and_clear_young(NULL, addr, pmd)) {
 				nr_hot++;
+				pmd_idx = pmd_index(addr);
+				meta->accesses[pmd_idx]++;
+			}
 		} while (pmd++, addr = next, addr < end);
 		end_ns = ktime_get_ns();
 
 		dur_us = (end_ns - start_ns) / 1000;
-		ftier_delay_us(fspin_period_us - dur_us);
-
-		if (remaining_tries)
-			--remaining_tries;
-
-		if (first_iter) {
-			first_iter = false;
-			continue;
-		}
+		dur_sum_us += dur_us;
+		sum_hot += nr_hot;
+		nr_spins++;
 
 		if (nr_hot < min_hot) {
-			incr_period = true;
 			fspin_period_us = incr_ftier_period_us(fspin_period_us);
 		} else if (nr_hot > max_hot) {
-			decr_period = true;
 			fspin_period_us = decr_ftier_period_us(fspin_period_us);
-		} else {
-			/* within target range */
-			break;
 		}
 
-		/* reached threshold */
-		if ((decr_period && (fspin_period_us == MIN_FSPIN_PERIOD_US)) ||
-				(incr_period && (fspin_period_us == MAX_FSPIN_PERIOD_US)))
-			break;
-
-		/* crossed the threshold once */
-		if (!remaining_tries && incr_period && decr_period)
-			break;
-
-	} while (true);
+		ftier_delay_us(fspin_period_us - dur_us);
+		remain_spin_us -= fspin_period_us;
+	} while ((remain_spin_us > fspin_period_us) && (nr_spins < MAX_SPINS));
 
 	meta->fspin_period_us = fspin_period_us;
-	pr_info("ftier: tune %lx fspin %u us, dur %u us, hot %u/%u\n",
-			meta->address, fspin_period_us, dur_us, nr_hot, meta->nr_mapped);
+	kfree(args);
+	pr_info("fspin[%lx]: spins=%u, spin_period_final=%u us,"
+					" dur_sum=%u us, hot=%u, mapped=%u\n",
+			meta->address, nr_spins, fspin_period_us,
+			dur_sum_us, sum_hot, meta->nr_mapped);
 }
 
-static void prepare_fspin(struct mm_struct *mm)
+static void do_fspin(struct mm_struct *mm)
 {
 	struct fhot_meta_gb *meta;
+	struct fspin_args *args;
 
 	list_for_each_entry(meta, &__ctx.target.fhot_list, siblings) {
 		count_mapped_entries(mm, meta);
-		tune_fspin_period(mm, meta);
+		if (meta->nr_mapped < 5) {
+			destroy_fhot_meta(meta);
+		} else {
+			args = kzalloc(sizeof(*args), GFP_KERNEL);
+			if (!args)
+				return;
+
+			INIT_WORK(&args->work, fspin);
+			args->mm = mm;
+			args->meta = meta;
+			queue_work(__ctx.target.wq, &args->work);
+		}
 	}
 }
 
@@ -326,8 +348,9 @@ static int ftier_fn(void *data)
 
 		fscan_page_tables(mm);
 
-		prepare_fspin(mm);
+		do_fspin(mm);
 
+		flush_workqueue(__ctx.target.wq);
 		mmput(mm);
 end_iter:
 		end_ns = ktime_get_ns();
@@ -363,6 +386,10 @@ int ftier_temptrack_start(void)
 		}
 		__ctx.target.pid = -1;
 		__ctx.target.nr_fhot = 0;
+		__ctx.target.wq = alloc_workqueue("ftier_wq",
+				WQ_UNBOUND|WQ_HIGHPRI|WQ_CPU_INTENSIVE, 0);
+		if (!__ctx.target.wq)
+			err = -ENOMEM;
 	}
 
 	return err;
@@ -384,6 +411,9 @@ int ftier_temptrack_stop(void)
 					struct fhot_meta_gb, siblings);
 			destroy_fhot_meta(meta);
 		}
+		flush_workqueue(__ctx.target.wq);
+		destroy_workqueue(__ctx.target.wq);
+		__ctx.target.wq = NULL;
 	}
 
 	return err;

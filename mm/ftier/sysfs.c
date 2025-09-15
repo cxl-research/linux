@@ -11,6 +11,7 @@
 
 enum ftier_status sysctl_ftier_status = FTIER_STATUS_OFF;
 unsigned int sysctl_fscan_period_ms = 10000; /* 10s */
+unsigned int sysctl_fspin_ms = 5000; /* 5s */
 static DEFINE_MUTEX(ftier_sysctl_lock);
 
 static const char *ftier_status_strs[] = {
@@ -155,10 +156,37 @@ static ssize_t fscan_period_ms_store(struct kobject *kobj,
 static struct kobj_attribute fscan_period_ms_attr =
 		__ATTR_RW(fscan_period_ms);
 
+static ssize_t fspin_ms_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", sysctl_fspin_ms);
+}
+
+static ssize_t fspin_ms_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	unsigned int period;
+	int err;
+
+	err = kstrtoint(buf, 10, &period);
+	if (err || period < 1000 || period > 60000) /* 1s - 1min */
+		return -EINVAL;
+
+	mutex_lock(&ftier_sysctl_lock);
+	sysctl_fspin_ms = period;
+	mutex_unlock(&ftier_sysctl_lock);
+
+	return count;
+}
+
+static struct kobj_attribute fspin_ms_attr =
+		__ATTR_RW(fspin_ms);
+
 static struct attribute *ftier_sysfs_attrs[] = {
 	&ftier_status_attr.attr,
 	&ftier_target_attr.attr,
 	&fscan_period_ms_attr.attr,
+	&fspin_ms_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(ftier_sysfs);

@@ -16,6 +16,7 @@
 /* Machine specific */
 #define CXL_NID(nid) ((nid) > 1)
 #define DRAM_NID(nid) ((nid) == 1)
+#define WQ_CPU 0
 
 #define pudp_clear_young_notify(__mm, __addr, __pudp)										\
 ({																																			\
@@ -38,13 +39,14 @@ struct fhot_meta_gb {
 	unsigned int fspin_period_us;
 	unsigned int nr_mapped;
 	struct list_head siblings;
-	// unsigned char accesses[512];
+	unsigned char accesses[512];
 };
 
 struct ftier_target {
 	pid_t pid;
 	struct list_head fhot_list;
 	unsigned int nr_fhot;
+	struct workqueue_struct *wq;
 };
 
 struct ftier_ctx {
@@ -53,6 +55,7 @@ struct ftier_ctx {
 };
 
 extern unsigned int sysctl_fscan_period_ms;
+extern unsigned int sysctl_fspin_ms;
 
 int ftier_temptrack_start(void);
 int ftier_temptrack_stop(void);
