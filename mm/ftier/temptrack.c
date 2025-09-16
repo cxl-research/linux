@@ -245,8 +245,8 @@ static void fspin(struct work_struct *work_args)
 	struct fspin_args *args;
 	unsigned long addr, next, end, pmd_idx;
 	uint64_t start_ns, end_ns;
-	unsigned int min_hot, max_hot, dur_us, dur_sum_us, nr_spins;
-	unsigned int fspin_period_us, nr_hot, sum_hot, remain_spin_us;
+	unsigned int min_hot, max_hot, dur_us, dur_sum_us;
+	int remain_spin_us, fspin_period_us, nr_spins, nr_hot, sum_hot;
 
 	args = container_of(work_args, struct fspin_args, work);
 	mm = args->mm;
@@ -294,7 +294,7 @@ static void fspin(struct work_struct *work_args)
 
 		ftier_delay_us(fspin_period_us - dur_us);
 		remain_spin_us -= fspin_period_us;
-	} while ((remain_spin_us > fspin_period_us) && (nr_spins < MAX_SPINS));
+	} while ((remain_spin_us > 0) && (nr_spins < MAX_SPINS));
 
 	meta->fspin_period_us = fspin_period_us;
 	kfree(args);
@@ -306,10 +306,10 @@ static void fspin(struct work_struct *work_args)
 
 static void do_fspin(struct mm_struct *mm)
 {
-	struct fhot_meta_gb *meta;
+	struct fhot_meta_gb *meta, *next;
 	struct fspin_args *args;
 
-	list_for_each_entry(meta, &__ctx.target.fhot_list, siblings) {
+	list_for_each_entry_safe(meta, next, &__ctx.target.fhot_list, siblings) {
 		count_mapped_entries(mm, meta);
 		if (meta->nr_mapped < 5) {
 			destroy_fhot_meta(meta);
@@ -347,16 +347,18 @@ static int ftier_fn(void *data)
 		}
 
 		fscan_page_tables(mm);
-
 		do_fspin(mm);
-
 		flush_workqueue(__ctx.target.wq);
+
 		mmput(mm);
 end_iter:
 		end_ns = ktime_get_ns();
 		dur_ms = (end_ns - start_ns) / 1000000;
 		while (dur_ms >= fscan_period_ms)
 			fscan_period_ms *= 2;
+		if (fscan_period_ms > sysctl_fscan_period_ms)
+			pr_info("fscan took too long (%u ms). period increased to %u ms\n",
+					dur_ms, fscan_period_ms);
 		ftier_delay_us((fscan_period_ms - dur_ms) * 1000);
 	}
 
