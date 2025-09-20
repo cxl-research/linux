@@ -12,6 +12,8 @@
 enum ftier_status sysctl_ftier_status = FTIER_STATUS_OFF;
 unsigned int sysctl_fscan_period_ms = 10000; /* 10s */
 unsigned int sysctl_fspin_ms = 5000; /* 5s */
+unsigned int sysctl_min_pmds_per_fscan = 3;
+unsigned int sysctl_max_fhot_pc = 60;
 static DEFINE_MUTEX(ftier_sysctl_lock);
 
 static const char *ftier_status_strs[] = {
@@ -182,11 +184,65 @@ static ssize_t fspin_ms_store(struct kobject *kobj,
 static struct kobj_attribute fspin_ms_attr =
 		__ATTR_RW(fspin_ms);
 
+static ssize_t min_pmds_per_fscan_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", sysctl_min_pmds_per_fscan);
+}
+
+static ssize_t min_pmds_per_fscan_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	unsigned int val;
+	int err;
+
+	err = kstrtoint(buf, 10, &val);
+	if (err || val < 1 || val > 100)
+		return -EINVAL;
+
+	mutex_lock(&ftier_sysctl_lock);
+	sysctl_min_pmds_per_fscan = val;
+	mutex_unlock(&ftier_sysctl_lock);
+
+	return count;
+}
+
+static struct kobj_attribute min_pmds_per_fscan_attr =
+		__ATTR_RW(min_pmds_per_fscan);
+
+static ssize_t max_fhot_pc_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", sysctl_max_fhot_pc);
+}
+
+static ssize_t max_fhot_pc_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	unsigned int val;
+	int err;
+
+	err = kstrtoint(buf, 10, &val);
+	if (err || val < 1 || val > 100)
+		return -EINVAL;
+
+	mutex_lock(&ftier_sysctl_lock);
+	sysctl_max_fhot_pc = val;
+	mutex_unlock(&ftier_sysctl_lock);
+
+	return count;
+}
+
+static struct kobj_attribute max_fhot_pc_attr =
+		__ATTR_RW(max_fhot_pc);
+
 static struct attribute *ftier_sysfs_attrs[] = {
 	&ftier_status_attr.attr,
 	&ftier_target_attr.attr,
 	&fscan_period_ms_attr.attr,
 	&fspin_ms_attr.attr,
+	&min_pmds_per_fscan_attr.attr,
+	&max_fhot_pc_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(ftier_sysfs);

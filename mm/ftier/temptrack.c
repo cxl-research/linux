@@ -12,6 +12,9 @@
 #include <linux/pagewalk.h>
 #include <linux/pgtable.h>
 
+#define CREATE_TRACE_POINTS
+#include <trace/events/ftier.h>
+
 struct ftier_ctx __ctx = {
 	.task = NULL,
 	.target = {
@@ -32,7 +35,6 @@ const unsigned int fspin_period_us_array[] = {
 #define MIN_FSPIN_PERIOD_US (fspin_period_us_array[0])
 #define MAX_FSPIN_PERIOD_US \
 		(fspin_period_us_array[ARRAY_SIZE(fspin_period_us_array) - 1])
-#define MAX_SPINS 255 /* max(unsigned char) */
 
 static inline int incr_ftier_period_us(unsigned int us)
 {
@@ -55,33 +57,11 @@ static inline int decr_ftier_period_us(unsigned int us)
 }
 
 static bool tiering_on = false;
+static bool fspinning = false;
 
 struct ftier_target *get_target(void)
 {
 	return &__ctx.target;
-}
-
-int set_target_pid(pid_t pid)
-{
-	struct task_struct *task;
-
-	if (pid == __ctx.target.pid)
-		return 0;
-
-	if (pid > 0) {
-		task = find_get_task_by_vpid(pid);
-		if (!task)
-			return -ESRCH;
-	}
-
-	if (__ctx.target.pid > 0) {
-		task = find_task_by_vpid(__ctx.target.pid);
-		if (task)
-			put_task_struct(task);
-	}
-
-	__ctx.target.pid = pid;
-	return 0;
 }
 
 static void ftier_delay_us(unsigned long us)
@@ -110,9 +90,9 @@ static struct mm_struct *get_target_mm(void)
 	return mm;
 }
 
-static inline void reset_accesses(struct fhot_meta_gb *meta)
+static inline void reset_spins(struct fhot_meta_gb *meta)
 {
-	memset(meta->accesses, 0, sizeof(meta->accesses));
+	memset(meta->spins, 0, sizeof(meta->spins));
 }
 
 static struct fhot_meta_gb * find_fhot_meta(unsigned long addr)
@@ -148,6 +128,47 @@ static void destroy_fhot_meta(struct fhot_meta_gb *meta)
 	__ctx.target.nr_fhot--;
 }
 
+int set_target_pid(pid_t pid)
+{
+	struct task_struct *task;
+	struct fhot_meta_gb *meta;
+
+	if (pid == __ctx.target.pid)
+		return 0;
+
+	if (__ctx.target.pid > 0) {
+		task = find_task_by_vpid(__ctx.target.pid);
+		if (task)
+			put_task_struct(task);
+
+		fspinning = false;
+		destroy_workqueue(__ctx.target.wq);
+		while (!list_empty(&__ctx.target.fhot_list)) {
+			meta = list_first_entry(&__ctx.target.fhot_list,
+					struct fhot_meta_gb, siblings);
+			destroy_fhot_meta(meta);
+		}
+		__ctx.target.wq = NULL;
+	}
+
+	if (pid > 0) {
+		task = find_get_task_by_vpid(pid);
+		if (!task)
+			return -ESRCH;
+
+		__ctx.target.wq = alloc_workqueue("ftier_wq",
+				WQ_UNBOUND|WQ_HIGHPRI|WQ_CPU_INTENSIVE, 0);
+		if (!__ctx.target.wq) {
+			put_task_struct(task);
+			return -ENOMEM;
+		}
+	}
+
+	__ctx.target.nr_fhot = 0;
+	__ctx.target.pid = pid;
+	return 0;
+}
+
 struct ftier_walk_private {
 	unsigned long count;
 	unsigned long pudmap[8];
@@ -160,6 +181,10 @@ static int fscan(pud_t *pud, unsigned long addr,
 	struct fhot_meta_gb *meta;
 	unsigned long mask;
 	unsigned int index;
+	static unsigned long last_addr = 0;
+
+	if (last_addr == (addr & PUD_MASK))
+		goto endscan;
 
 	if (pud_young(*pud)) {
 		pudp_clear_young_notify(walk->mm, addr, pud);
@@ -172,7 +197,7 @@ static int fscan(pud_t *pud, unsigned long addr,
 			if (!meta)
 				alloc_fhot_meta(pud, addr);
 			else
-				reset_accesses(meta);
+				reset_spins(meta);
 		}
 	} else if (!(priv->pudmap[(index >> 6)] & mask)) {
 		meta = find_fhot_meta(addr);
@@ -180,6 +205,8 @@ static int fscan(pud_t *pud, unsigned long addr,
 			destroy_fhot_meta(meta);
 	}
 
+	last_addr = addr & PUD_MASK;
+endscan:
 	walk->action = ACTION_CONTINUE;
 	return 0;
 }
@@ -201,11 +228,8 @@ static void fscan_page_tables(struct mm_struct *mm)
 	mmap_read_unlock(mm);
 	end_ns = ktime_get_ns();
 
-	pr_info("ftier: %lu 1GB pages (hot=%u) accessed in %llu ns:\t"
-					"%lx %lx %lx %lx %lx %lx %lx %lx\n",
-			priv.count, __ctx.target.nr_fhot, (end_ns - start_ns),
-			priv.pudmap[0], priv.pudmap[1], priv.pudmap[2], priv.pudmap[3],
-			priv.pudmap[4], priv.pudmap[5], priv.pudmap[6], priv.pudmap[7]);
+	trace_fscan(__ctx.target.pid, __ctx.target.nr_fhot,
+			(end_ns - start_ns) / 1000, priv.pudmap);
 }
 
 static void count_mapped_entries(struct mm_struct *mm,
@@ -253,8 +277,8 @@ static void fspin(struct work_struct *work_args)
 	meta = args->meta;
 
 	pud = meta->pud;
-	min_hot = 4 * meta->nr_mapped / 10;
-	max_hot = 6 * meta->nr_mapped / 10;
+	min_hot = sysctl_min_pmds_per_fscan;
+	max_hot = sysctl_max_fhot_pc * meta->nr_mapped / 100;
 	remain_spin_us = sysctl_fspin_ms * 1000;
 	fspin_period_us = meta->fspin_period_us;
 	dur_sum_us = 0;
@@ -267,6 +291,9 @@ static void fspin(struct work_struct *work_args)
 		end = addr + PUD_SIZE;
 		pmd = pmd_offset(pud, addr);
 
+		if (!fspinning)
+			break;
+
 		start_ns = ktime_get_ns();
 		do {
 			next = pmd_addr_end(addr, end);
@@ -276,7 +303,7 @@ static void fspin(struct work_struct *work_args)
 			if (pmdp_test_and_clear_young(NULL, addr, pmd)) {
 				nr_hot++;
 				pmd_idx = pmd_index(addr);
-				meta->accesses[pmd_idx]++;
+				meta->spins[pmd_idx]++;
 			}
 		} while (pmd++, addr = next, addr < end);
 		end_ns = ktime_get_ns();
@@ -298,9 +325,8 @@ static void fspin(struct work_struct *work_args)
 
 	meta->fspin_period_us = fspin_period_us;
 	kfree(args);
-	pr_info("fspin[%lx]: spins=%u, spin_period_final=%u us,"
-					" dur_sum=%u us, hot=%u, mapped=%u\n",
-			meta->address, nr_spins, fspin_period_us,
+
+	trace_fspin(meta->address, nr_spins, fspin_period_us,
 			dur_sum_us, sum_hot, meta->nr_mapped);
 }
 
@@ -347,8 +373,14 @@ static int ftier_fn(void *data)
 		}
 
 		fscan_page_tables(mm);
+
+		fspinning = true;
 		do_fspin(mm);
 		flush_workqueue(__ctx.target.wq);
+		fspinning = false;
+
+		if (tiering_on && !kthread_should_stop())
+			ftier_tier_memory(&__ctx.target);
 
 		mmput(mm);
 end_iter:
@@ -404,18 +436,18 @@ int ftier_temptrack_stop(void)
 
 	if (__ctx.task) {
 		kthread_stop(__ctx.task);
+		fspinning = false;
 		err = 0;
 		__ctx.task = NULL;
 		__ctx.target.pid = -1;
 		__ctx.target.nr_fhot = 0;
+		if (__ctx.target.wq)
+			destroy_workqueue(__ctx.target.wq);
 		while (!list_empty(&__ctx.target.fhot_list)) {
 			meta = list_first_entry(&__ctx.target.fhot_list,
 					struct fhot_meta_gb, siblings);
 			destroy_fhot_meta(meta);
 		}
-		flush_workqueue(__ctx.target.wq);
-		destroy_workqueue(__ctx.target.wq);
-		__ctx.target.wq = NULL;
 	}
 
 	return err;

@@ -39,8 +39,10 @@ struct fhot_meta_gb {
 	unsigned int fspin_period_us;
 	unsigned int nr_mapped;
 	struct list_head siblings;
-	unsigned char accesses[512];
+	unsigned char spins[512];
 };
+
+#define MAX_SPINS 255 /* max(unsigned char) */
 
 struct ftier_target {
 	pid_t pid;
@@ -56,11 +58,14 @@ struct ftier_ctx {
 
 extern unsigned int sysctl_fscan_period_ms;
 extern unsigned int sysctl_fspin_ms;
+extern unsigned int sysctl_min_pmds_per_fscan;
+extern unsigned int sysctl_max_fhot_pc;
 
 int ftier_temptrack_start(void);
 int ftier_temptrack_stop(void);
 void ftier_tiering_start(void);
 void ftier_tiering_stop(void);
+void ftier_tier_memory(struct ftier_target *t);
 
 struct ftier_target *get_target(void);
 int set_target_pid(pid_t pid);

@@ -1,0 +1,97 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#undef TRACE_SYSTEM
+#define TRACE_SYSTEM ftier
+
+#if !defined(_TRACE_FTIER_H) || defined(TRACE_HEADER_MULTI_READ)
+#define _TRACE_FTIER_H
+
+#include <linux/types.h>
+#include <linux/tracepoint.h>
+
+TRACE_EVENT(fscan,
+
+	TP_PROTO(unsigned int pid, unsigned int nr_fhot,
+		unsigned int dur_us, unsigned long *pudmap),
+
+	TP_ARGS(pid, nr_fhot, dur_us, pudmap),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, pid)
+		__field(unsigned int, nr_fhot)
+		__field(unsigned int, dur_us)
+		__array(unsigned long, pudmap, 8)
+	),
+
+	TP_fast_assign(
+		__entry->pid = pid;
+		__entry->nr_fhot = nr_fhot;
+		__entry->dur_us = dur_us;
+		memcpy(__entry->pudmap, pudmap, sizeof(unsigned long) * 8);
+	),
+
+	TP_printk("pid=%u, nr_fhot=%u, dur=%u us, "
+			"pudmap=[%lx %lx %lx %lx %lx %lx %lx %lx]",
+			__entry->pid, __entry->nr_fhot, __entry->dur_us,
+			__entry->pudmap[0], __entry->pudmap[1], __entry->pudmap[2],
+			__entry->pudmap[3], __entry->pudmap[4], __entry->pudmap[5],
+			__entry->pudmap[6], __entry->pudmap[7])
+);
+
+TRACE_EVENT(fspin,
+
+	TP_PROTO(unsigned long addr, unsigned int spins,
+		unsigned int spin_period_final_us, unsigned int dur_sum_us,
+		unsigned int hot, unsigned int mapped),
+
+	TP_ARGS(addr, spins, spin_period_final_us,
+			dur_sum_us, hot, mapped),
+
+	TP_STRUCT__entry(
+		__field(unsigned long, addr)
+		__field(unsigned int, spins)
+		__field(unsigned int, spin_period_final_us)
+		__field(unsigned int, dur_sum_us)
+		__field(unsigned int, hot)
+		__field(unsigned int, mapped)
+	),
+
+	TP_fast_assign(
+		__entry->addr = addr;
+		__entry->spins = spins;
+		__entry->spin_period_final_us = spin_period_final_us;
+		__entry->dur_sum_us = dur_sum_us;
+		__entry->hot = hot;
+		__entry->mapped = mapped;
+	),
+
+	TP_printk("addr=%lx, spins=%u, spin_period_final=%u us,"
+			" dur_sum=%u us, hot=%u, mapped=%u",
+			__entry->addr, __entry->spins, __entry->spin_period_final_us,
+			__entry->dur_sum_us, __entry->hot, __entry->mapped)
+);
+
+TRACE_EVENT(fhist,
+
+	TP_PROTO(unsigned int pid, unsigned int hotval, unsigned int mb),
+
+	TP_ARGS(pid, hotval, mb),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, pid)
+		__field(unsigned int, hotval)
+		__field(unsigned int, mb)
+	),
+
+	TP_fast_assign(
+		__entry->pid = pid;
+		__entry->hotval = hotval;
+		__entry->mb = mb;
+	),
+
+	TP_printk("pid=%u, hotval=%u, mb=%u",
+			__entry->pid, __entry->hotval, __entry->mb)
+);
+
+#endif /* _TRACE_FTIER_H */
+
+#include <trace/define_trace.h>
