@@ -91,18 +91,18 @@ static ssize_t ftier_status_store(struct kobject *kobj,
 static struct kobj_attribute ftier_status_attr =
 		__ATTR_RW(ftier_status);
 
-static ssize_t ftier_target_show(struct kobject *kobj,
+static ssize_t target_pid_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
 	struct ftier_target *target = get_target();
 	pid_t pid = target->pid;
 
 	if (pid < 0)
-		return sysfs_emit(buf, "no target\n");
+		return sysfs_emit(buf, "no target pid set\n");
 	return sysfs_emit(buf, "pid:%d\n", pid);
 }
 
-static ssize_t ftier_target_store(struct kobject *kobj,
+static ssize_t target_pid_store(struct kobject *kobj,
 		struct kobj_attribute *attr, const char *buf, size_t count)
 {
 	pid_t pid;
@@ -123,14 +123,62 @@ static ssize_t ftier_target_store(struct kobject *kobj,
 	err = set_target_pid(pid);
 	mutex_unlock(&ftier_sysctl_lock);
 
-	if (err)
-		return err;
-
-	return count;
+	return err ? err : count;
 }
 
-static struct kobj_attribute ftier_target_attr =
-		__ATTR_RW(ftier_target);
+static struct kobj_attribute target_pid_attr =
+		__ATTR_RW(target_pid);
+
+static ssize_t target_cgroup_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct ftier_target *target = get_target();
+	struct cgroup *cg = target->cg;
+	char path[128];
+	int len;
+
+	if (!cg)
+		return sysfs_emit(buf, "no target cgroup set\n");
+
+	len = cgroup_path(cg, path, sizeof(path));
+	if (len < 0)
+		return len;
+
+	return sysfs_emit(buf, "cgroup:%s\n", path);
+}
+
+static ssize_t target_cgroup_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	char path[128];
+	int err, len;
+
+	if (sysctl_ftier_status == FTIER_STATUS_OFF)
+		return -EPERM;
+
+	len = count;
+	if (count && (buf[count - 1] == '\n'))
+		len--;
+
+	memcpy(path, buf, len);
+	path[len] = '\0';
+
+	if (sysfs_streq(path, "none")) {
+		mutex_lock(&ftier_sysctl_lock);
+		err = set_target_cgroup(NULL);
+		mutex_unlock(&ftier_sysctl_lock);
+		return err ? err : count;
+	}
+
+	mutex_lock(&ftier_sysctl_lock);
+	err = set_target_cgroup(path);
+	mutex_unlock(&ftier_sysctl_lock);
+
+	return err ? err : count;
+}
+
+static struct kobj_attribute target_cgroup_attr =
+		__ATTR_RW(target_cgroup);
 
 static ssize_t fscan_period_ms_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
@@ -238,7 +286,8 @@ static struct kobj_attribute max_fhot_pc_attr =
 
 static struct attribute *ftier_sysfs_attrs[] = {
 	&ftier_status_attr.attr,
-	&ftier_target_attr.attr,
+	&target_pid_attr.attr,
+	&target_cgroup_attr.attr,
 	&fscan_period_ms_attr.attr,
 	&fspin_ms_attr.attr,
 	&min_pmds_per_fscan_attr.attr,

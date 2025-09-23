@@ -19,6 +19,8 @@ struct ftier_ctx __ctx = {
 	.task = NULL,
 	.target = {
 		.pid = -1,
+		.cg = NULL,
+		.type = FTIER_TARGET_PID,
 		.fhot_list = LIST_HEAD_INIT(__ctx.target.fhot_list),
 		.nr_fhot = 0,
 		.wq = NULL,
@@ -74,38 +76,24 @@ static void ftier_delay_us(unsigned long us)
 		msleep_interruptible(us / 1000);
 }
 
-static struct mm_struct *get_target_mm(void)
-{
-	struct task_struct *task;
-	struct mm_struct *mm = NULL;
-
-	if (__ctx.target.pid < 0)
-		return NULL;
-
-	task = find_task_by_vpid(__ctx.target.pid);
-	if (!task)
-		return NULL;
-	mm = get_task_mm(task);
-
-	return mm;
-}
-
 static inline void reset_spins(struct fhot_meta_gb *meta)
 {
 	memset(meta->spins, 0, sizeof(meta->spins));
 }
 
-static struct fhot_meta_gb * find_fhot_meta(unsigned long addr)
+static struct fhot_meta_gb * find_fhot_meta(struct mm_struct *mm,
+		unsigned long addr)
 {
 	struct fhot_meta_gb *meta;
 	list_for_each_entry(meta, &__ctx.target.fhot_list, siblings) {
-		if (meta->address == (addr & PUD_MASK))
+		if ((meta->address == (addr & PUD_MASK)) && (meta->mm == mm))
 			return meta;
 	}
 	return NULL;
 }
 
-static void alloc_fhot_meta(pud_t *pud, unsigned long addr)
+static void alloc_fhot_meta(struct mm_struct *mm,
+		pud_t *pud, unsigned long addr)
 {
 	struct fhot_meta_gb *meta;
 
@@ -113,6 +101,7 @@ static void alloc_fhot_meta(pud_t *pud, unsigned long addr)
 	if (!meta)
 		return;
 
+	meta->mm = mm;
 	meta->pud = pud;
 	meta->address = addr & PUD_MASK;
 	meta->fspin_period_us = 20000; /* 20ms */
@@ -126,6 +115,47 @@ static void destroy_fhot_meta(struct fhot_meta_gb *meta)
 	list_del(&meta->siblings);
 	kfree(meta);
 	__ctx.target.nr_fhot--;
+}
+
+int set_target_cgroup(const char *path)
+{
+	struct cgroup *cgrp;
+
+	if (!path && !__ctx.target.cg)
+		return 0;
+
+	if (__ctx.target.cg) {
+		cgroup_put(__ctx.target.cg);
+		cgrp = NULL;
+
+		fspinning = false;
+		destroy_workqueue(__ctx.target.wq);
+		while (!list_empty(&__ctx.target.fhot_list)) {
+			struct fhot_meta_gb *meta;
+			meta = list_first_entry(&__ctx.target.fhot_list,
+					struct fhot_meta_gb, siblings);
+			destroy_fhot_meta(meta);
+		}
+		__ctx.target.wq = NULL;
+	}
+
+	if (path) {
+		cgrp = cgroup_get_from_path(path);
+		if (IS_ERR(cgrp))
+			return PTR_ERR(cgrp);
+
+		__ctx.target.wq = alloc_workqueue("ftier_wq",
+				WQ_UNBOUND|WQ_HIGHPRI|WQ_CPU_INTENSIVE, 0);
+		if (!__ctx.target.wq) {
+			cgroup_put(cgrp);
+			return -ENOMEM;
+		}
+	}
+
+	__ctx.target.cg = cgrp;
+	__ctx.target.type = FTIER_TARGET_CGROUP;
+	__ctx.target.nr_fhot = 0;
+	return 0;
 }
 
 int set_target_pid(pid_t pid)
@@ -166,6 +196,7 @@ int set_target_pid(pid_t pid)
 
 	__ctx.target.nr_fhot = 0;
 	__ctx.target.pid = pid;
+	__ctx.target.type = FTIER_TARGET_PID;
 	return 0;
 }
 
@@ -193,14 +224,14 @@ static int fscan(pud_t *pud, unsigned long addr,
 		if (!(priv->pudmap[(index >> 6)] & mask)) {
 			priv->count++;
 			priv->pudmap[(index >> 6)] |= mask;
-			meta = find_fhot_meta(addr);
+			meta = find_fhot_meta(walk->mm, addr);
 			if (!meta)
-				alloc_fhot_meta(pud, addr);
+				alloc_fhot_meta(walk->mm, pud, addr);
 			else
 				reset_spins(meta);
 		}
 	} else if (!(priv->pudmap[(index >> 6)] & mask)) {
-		meta = find_fhot_meta(addr);
+		meta = find_fhot_meta(walk->mm, addr);
 		if (meta)
 			destroy_fhot_meta(meta);
 	}
@@ -216,7 +247,7 @@ static const struct mm_walk_ops ftier_walk_ops = {
 	.walk_lock = PGWALK_RDLOCK,
 };
 
-static void fscan_page_tables(struct mm_struct *mm)
+static void fscan_page_tables_mm(struct mm_struct *mm)
 {
 	unsigned long start = 0, end = 0x7fffffffffffUL;
 	struct ftier_walk_private priv = { .count = 0, .pudmap = {0} };
@@ -232,8 +263,44 @@ static void fscan_page_tables(struct mm_struct *mm)
 			(end_ns - start_ns) / 1000, priv.pudmap);
 }
 
-static void count_mapped_entries(struct mm_struct *mm,
-			struct fhot_meta_gb *meta)
+static void fscan_page_tables(void)
+{
+	struct mm_struct *mm;
+	struct task_struct *task;
+	struct cgroup *cg;
+	struct css_task_iter it;
+
+	if (__ctx.target.type == FTIER_TARGET_PID) {
+		if (__ctx.target.pid < 0)
+			return;
+
+		task = find_task_by_vpid(__ctx.target.pid);
+		if (!task)
+			return;
+
+		mm = get_task_mm(task);
+		if (mm) {
+			fscan_page_tables_mm(mm);
+			mmput(mm);
+		}
+	} else {
+		cg = __ctx.target.cg;
+		if (!cg)
+			return;
+
+		css_task_iter_start(&cg->self, CSS_TASK_ITER_PROCS, &it);
+		while ((task = css_task_iter_next(&it))) {
+			mm = get_task_mm(task);
+			if (mm) {
+				fscan_page_tables_mm(mm);
+				mmput(mm);
+			}
+		}
+		css_task_iter_end(&it);
+	}
+}
+
+static void count_mapped_entries(struct fhot_meta_gb *meta)
 {
 	pud_t *pud = meta->pud;
 	pmd_t *pmd;
@@ -256,7 +323,6 @@ static void count_mapped_entries(struct mm_struct *mm,
 
 struct fspin_args {
 	struct work_struct work;
-	struct mm_struct *mm;
 	struct fhot_meta_gb *meta;
 };
 
@@ -273,8 +339,11 @@ static void fspin(struct work_struct *work_args)
 	int remain_spin_us, fspin_period_us, nr_spins, nr_hot, sum_hot;
 
 	args = container_of(work_args, struct fspin_args, work);
-	mm = args->mm;
 	meta = args->meta;
+	mm = meta->mm;
+
+	if (!mm)
+		goto free_out;
 
 	pud = meta->pud;
 	min_hot = sysctl_min_pmds_per_fscan;
@@ -285,6 +354,7 @@ static void fspin(struct work_struct *work_args)
 	nr_spins = 0;
 	sum_hot = 0;
 
+	mmget(mm);
 	do {
 		nr_hot = 0;
 		addr = meta->address;
@@ -319,24 +389,29 @@ static void fspin(struct work_struct *work_args)
 			fspin_period_us = decr_ftier_period_us(fspin_period_us);
 		}
 
+		while ((dur_us + 10) > fspin_period_us)
+			fspin_period_us = incr_ftier_period_us(fspin_period_us);
+
 		ftier_delay_us(fspin_period_us - dur_us);
 		remain_spin_us -= fspin_period_us;
 	} while ((remain_spin_us > 0) && (nr_spins < MAX_SPINS));
 
 	meta->fspin_period_us = fspin_period_us;
+	mmput(mm);
+free_out:
 	kfree(args);
 
 	trace_fspin(meta->address, nr_spins, fspin_period_us,
 			dur_sum_us, sum_hot, meta->nr_mapped);
 }
 
-static void do_fspin(struct mm_struct *mm)
+static void do_fspin(void)
 {
 	struct fhot_meta_gb *meta, *next;
 	struct fspin_args *args;
 
 	list_for_each_entry_safe(meta, next, &__ctx.target.fhot_list, siblings) {
-		count_mapped_entries(mm, meta);
+		count_mapped_entries(meta);
 		if (meta->nr_mapped < 5) {
 			destroy_fhot_meta(meta);
 		} else {
@@ -345,44 +420,81 @@ static void do_fspin(struct mm_struct *mm)
 				return;
 
 			INIT_WORK(&args->work, fspin);
-			args->mm = mm;
 			args->meta = meta;
 			queue_work(__ctx.target.wq, &args->work);
 		}
 	}
 }
 
+static bool target_alive(void)
+{
+	struct task_struct *task;
+	struct mm_struct *mm;
+	struct css_task_iter it;
+	struct cgroup *cg;
+	bool is_alive = false;
+
+	if (__ctx.target.type == FTIER_TARGET_PID) {
+		if (__ctx.target.pid < 0)
+			return false;
+
+		task = find_task_by_vpid(__ctx.target.pid);
+		if (!task)
+			return false;
+
+		mm = get_task_mm(task);
+		if (!mm) {
+			set_target_pid(-1);
+			return false;
+		}
+		mmput(mm);
+		is_alive = true;
+	} else {
+		/* there exists at least one task in the cgroup ? */
+		cg = __ctx.target.cg;
+		if (!cg)
+			return false;
+
+		css_task_iter_start(&cg->self, CSS_TASK_ITER_PROCS, &it);
+		while ((task = css_task_iter_next(&it))) {
+			mm = get_task_mm(task);
+			if (mm) {
+				is_alive = true;
+				mmput(mm);
+				break;
+			}
+		}
+		css_task_iter_end(&it);
+	}
+
+	return is_alive;
+}
+
 static int ftier_fn(void *data)
 {
-	struct mm_struct *mm;
-	unsigned int fscan_period_ms, dur_ms;
+	unsigned int fscan_period_ms, fspin_ms, dur_ms;
 	uint64_t start_ns, end_ns;
 
 	while (!kthread_should_stop()) {
 		start_ns = ktime_get_ns();
 		fscan_period_ms = sysctl_fscan_period_ms;
+		fspin_ms = sysctl_fspin_ms;
 
-		if (__ctx.target.pid < 0)
+		if (!target_alive())
 			goto end_iter;
 
-		mm = get_target_mm();
-		if (!mm) {
-			/* target process has exited */
-			set_target_pid(-1);
-			goto end_iter;
-		}
-
-		fscan_page_tables(mm);
+		fscan_page_tables();
 
 		fspinning = true;
-		do_fspin(mm);
-		flush_workqueue(__ctx.target.wq);
+		do_fspin();
+		ftier_delay_us(fspin_ms * 1000);
+
 		fspinning = false;
+		flush_workqueue(__ctx.target.wq);
 
 		if (tiering_on && !kthread_should_stop())
 			ftier_tier_memory(&__ctx.target);
 
-		mmput(mm);
 end_iter:
 		end_ns = ktime_get_ns();
 		dur_ms = (end_ns - start_ns) / 1000000;

@@ -33,8 +33,15 @@ enum ftier_status {
 	NR_FTIER_STATUSES,
 };
 
+enum ftier_target_type {
+	FTIER_TARGET_PID, /* default */
+	FTIER_TARGET_CGROUP,
+	NR_FTIER_TARGET_TYPES,
+};
+
 struct fhot_meta_gb {
 	pud_t *pud;
+	struct mm_struct *mm;
 	unsigned long address;
 	unsigned int fspin_period_us;
 	unsigned int nr_mapped;
@@ -46,6 +53,8 @@ struct fhot_meta_gb {
 
 struct ftier_target {
 	pid_t pid;
+	struct cgroup *cg;
+	enum ftier_target_type type;
 	struct list_head fhot_list;
 	unsigned int nr_fhot;
 	struct workqueue_struct *wq;
@@ -69,3 +78,4 @@ void ftier_tier_memory(struct ftier_target *t);
 
 struct ftier_target *get_target(void);
 int set_target_pid(pid_t pid);
+int set_target_cgroup(const char *path);
