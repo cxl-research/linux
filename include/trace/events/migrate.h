@@ -23,6 +23,7 @@
 	EM( MR_CONTIG_RANGE,	"contig_range")			\
 	EM( MR_LONGTERM_PIN,	"longterm_pin")			\
 	EM( MR_DEMOTION,	"demotion")			\
+	EM( MR_FTIER,		"ftier")			\
 	EMe(MR_DAMON,		"damon")
 
 /*

@@ -14,6 +14,7 @@ unsigned int sysctl_fscan_period_ms = 10000; /* 10s */
 unsigned int sysctl_fspin_ms = 5000; /* 5s */
 unsigned int sysctl_min_pmds_per_fscan = 3;
 unsigned int sysctl_max_fhot_pc = 60;
+int sysctl_promote_mb = 0;
 static DEFINE_MUTEX(ftier_sysctl_lock);
 
 static const char *ftier_status_strs[] = {
@@ -284,6 +285,31 @@ static ssize_t max_fhot_pc_store(struct kobject *kobj,
 static struct kobj_attribute max_fhot_pc_attr =
 		__ATTR_RW(max_fhot_pc);
 
+static ssize_t promote_mb_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", sysctl_promote_mb);
+}
+
+static ssize_t promote_mb_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int val, err;
+
+	err = kstrtoint(buf, 10, &val);
+	if (err || val > 102400 || val < -102400) /* max 100GB */
+		return -EINVAL;
+
+	mutex_lock(&ftier_sysctl_lock);
+	sysctl_promote_mb = val;
+	mutex_unlock(&ftier_sysctl_lock);
+
+	return count;
+}
+
+static struct kobj_attribute promote_mb_attr =
+		__ATTR_RW(promote_mb);
+
 static struct attribute *ftier_sysfs_attrs[] = {
 	&ftier_status_attr.attr,
 	&target_pid_attr.attr,
@@ -292,6 +318,7 @@ static struct attribute *ftier_sysfs_attrs[] = {
 	&fspin_ms_attr.attr,
 	&min_pmds_per_fscan_attr.attr,
 	&max_fhot_pc_attr.attr,
+	&promote_mb_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(ftier_sysfs);

@@ -16,7 +16,7 @@
 /* Machine specific */
 #define CXL_NID(nid) ((nid) > 1)
 #define DRAM_NID(nid) ((nid) == 1)
-#define WQ_CPU 0
+#define NR_NODES 4
 
 #define pudp_clear_young_notify(__mm, __addr, __pudp)										\
 ({																																			\
@@ -41,6 +41,7 @@ enum ftier_target_type {
 
 struct fhot_meta_gb {
 	pud_t *pud;
+	pid_t pid;
 	struct mm_struct *mm;
 	unsigned long address;
 	unsigned int fspin_period_us;
@@ -69,6 +70,7 @@ extern unsigned int sysctl_fscan_period_ms;
 extern unsigned int sysctl_fspin_ms;
 extern unsigned int sysctl_min_pmds_per_fscan;
 extern unsigned int sysctl_max_fhot_pc;
+extern int sysctl_promote_mb;
 
 int ftier_temptrack_start(void);
 int ftier_temptrack_stop(void);

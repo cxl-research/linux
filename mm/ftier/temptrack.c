@@ -82,18 +82,19 @@ static inline void reset_spins(struct fhot_meta_gb *meta)
 }
 
 static struct fhot_meta_gb * find_fhot_meta(struct mm_struct *mm,
-		unsigned long addr)
+		pid_t pid, unsigned long addr)
 {
 	struct fhot_meta_gb *meta;
 	list_for_each_entry(meta, &__ctx.target.fhot_list, siblings) {
-		if ((meta->address == (addr & PUD_MASK)) && (meta->mm == mm))
+		if ((meta->address == (addr & PUD_MASK)) &&
+				(meta->mm == mm) && (meta->pid == pid))
 			return meta;
 	}
 	return NULL;
 }
 
 static void alloc_fhot_meta(struct mm_struct *mm,
-		pud_t *pud, unsigned long addr)
+		pud_t *pud, pid_t pid, unsigned long addr)
 {
 	struct fhot_meta_gb *meta;
 
@@ -101,10 +102,12 @@ static void alloc_fhot_meta(struct mm_struct *mm,
 	if (!meta)
 		return;
 
+	meta->pid = pid;
 	meta->mm = mm;
 	meta->pud = pud;
 	meta->address = addr & PUD_MASK;
 	meta->fspin_period_us = 20000; /* 20ms */
+
 	INIT_LIST_HEAD(&meta->siblings);
 	list_add(&meta->siblings, &__ctx.target.fhot_list);
 	__ctx.target.nr_fhot++;
@@ -203,12 +206,14 @@ int set_target_pid(pid_t pid)
 struct ftier_walk_private {
 	unsigned long count;
 	unsigned long pudmap[8];
+	pid_t pid;
 };
 
 static int fscan(pud_t *pud, unsigned long addr,
 		     unsigned long end, struct mm_walk *walk)
 {
 	struct ftier_walk_private *priv = walk->private;
+	pid_t pid = priv->pid;
 	struct fhot_meta_gb *meta;
 	unsigned long mask;
 	unsigned int index;
@@ -224,14 +229,14 @@ static int fscan(pud_t *pud, unsigned long addr,
 		if (!(priv->pudmap[(index >> 6)] & mask)) {
 			priv->count++;
 			priv->pudmap[(index >> 6)] |= mask;
-			meta = find_fhot_meta(walk->mm, addr);
+			meta = find_fhot_meta(walk->mm, pid, addr);
 			if (!meta)
-				alloc_fhot_meta(walk->mm, pud, addr);
+				alloc_fhot_meta(walk->mm, pud, pid, addr);
 			else
 				reset_spins(meta);
 		}
 	} else if (!(priv->pudmap[(index >> 6)] & mask)) {
-		meta = find_fhot_meta(walk->mm, addr);
+		meta = find_fhot_meta(walk->mm, pid, addr);
 		if (meta)
 			destroy_fhot_meta(meta);
 	}
@@ -247,10 +252,12 @@ static const struct mm_walk_ops ftier_walk_ops = {
 	.walk_lock = PGWALK_RDLOCK,
 };
 
-static void fscan_page_tables_mm(struct mm_struct *mm)
+static void fscan_page_tables_mm(struct mm_struct *mm, pid_t pid)
 {
 	unsigned long start = 0, end = 0x7fffffffffffUL;
-	struct ftier_walk_private priv = { .count = 0, .pudmap = {0} };
+	struct ftier_walk_private priv = {
+			.count = 0, .pudmap = {0}, .pid = pid,
+	};
 	uint64_t start_ns, end_ns;
 
 	start_ns = ktime_get_ns();
@@ -259,7 +266,7 @@ static void fscan_page_tables_mm(struct mm_struct *mm)
 	mmap_read_unlock(mm);
 	end_ns = ktime_get_ns();
 
-	trace_fscan(__ctx.target.pid, __ctx.target.nr_fhot,
+	trace_fscan(pid, __ctx.target.nr_fhot,
 			(end_ns - start_ns) / 1000, priv.pudmap);
 }
 
@@ -280,7 +287,7 @@ static void fscan_page_tables(void)
 
 		mm = get_task_mm(task);
 		if (mm) {
-			fscan_page_tables_mm(mm);
+			fscan_page_tables_mm(mm, __ctx.target.pid);
 			mmput(mm);
 		}
 	} else {
@@ -292,7 +299,7 @@ static void fscan_page_tables(void)
 		while ((task = css_task_iter_next(&it))) {
 			mm = get_task_mm(task);
 			if (mm) {
-				fscan_page_tables_mm(mm);
+				fscan_page_tables_mm(mm, task->pid);
 				mmput(mm);
 			}
 		}
@@ -401,8 +408,8 @@ static void fspin(struct work_struct *work_args)
 free_out:
 	kfree(args);
 
-	trace_fspin(meta->address, nr_spins, fspin_period_us,
-			dur_sum_us, sum_hot, meta->nr_mapped);
+	trace_fspin(meta->pid, meta->address, nr_spins,
+			fspin_period_us, dur_sum_us, sum_hot, meta->nr_mapped);
 }
 
 static void do_fspin(void)
