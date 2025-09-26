@@ -113,8 +113,20 @@ static void alloc_fhot_meta(struct mm_struct *mm,
 	__ctx.target.nr_fhot++;
 }
 
-static void destroy_fhot_meta(struct fhot_meta_gb *meta)
+static void destroy_fhot_meta(struct fhot_meta_gb *meta, bool force)
 {
+	unsigned long mapsum = 0;
+	int idx;
+
+	/* dont destroy if we may lose CXL mapping info */
+	if (!force) {
+		for (idx = 0; idx < 8; ++idx)
+			mapsum |= meta->cxlmap[idx];
+	}
+
+	if (mapsum)
+		return;
+
 	list_del(&meta->siblings);
 	kfree(meta);
 	__ctx.target.nr_fhot--;
@@ -137,7 +149,7 @@ int set_target_cgroup(const char *path)
 			struct fhot_meta_gb *meta;
 			meta = list_first_entry(&__ctx.target.fhot_list,
 					struct fhot_meta_gb, siblings);
-			destroy_fhot_meta(meta);
+			destroy_fhot_meta(meta, true);
 		}
 		__ctx.target.wq = NULL;
 	}
@@ -179,7 +191,7 @@ int set_target_pid(pid_t pid)
 		while (!list_empty(&__ctx.target.fhot_list)) {
 			meta = list_first_entry(&__ctx.target.fhot_list,
 					struct fhot_meta_gb, siblings);
-			destroy_fhot_meta(meta);
+			destroy_fhot_meta(meta, true);
 		}
 		__ctx.target.wq = NULL;
 	}
@@ -205,7 +217,6 @@ int set_target_pid(pid_t pid)
 
 struct ftier_walk_private {
 	unsigned long count;
-	unsigned long pudmap[8];
 	pid_t pid;
 };
 
@@ -215,8 +226,6 @@ static int fscan(pud_t *pud, unsigned long addr,
 	struct ftier_walk_private *priv = walk->private;
 	pid_t pid = priv->pid;
 	struct fhot_meta_gb *meta;
-	unsigned long mask;
-	unsigned int index;
 	static unsigned long last_addr = 0;
 
 	if (last_addr == (addr & PUD_MASK))
@@ -224,21 +233,16 @@ static int fscan(pud_t *pud, unsigned long addr,
 
 	if (pud_young(*pud)) {
 		pudp_clear_young_notify(walk->mm, addr, pud);
-		index = pud_index(addr);
-		mask = 1UL << (index & 0x3f);
-		if (!(priv->pudmap[(index >> 6)] & mask)) {
-			priv->count++;
-			priv->pudmap[(index >> 6)] |= mask;
-			meta = find_fhot_meta(walk->mm, pid, addr);
-			if (!meta)
-				alloc_fhot_meta(walk->mm, pud, pid, addr);
-			else
-				reset_spins(meta);
-		}
-	} else if (!(priv->pudmap[(index >> 6)] & mask)) {
+		priv->count++;
+		meta = find_fhot_meta(walk->mm, pid, addr);
+		if (!meta)
+			alloc_fhot_meta(walk->mm, pud, pid, addr);
+		else
+			reset_spins(meta);
+	} else {
 		meta = find_fhot_meta(walk->mm, pid, addr);
 		if (meta)
-			destroy_fhot_meta(meta);
+			destroy_fhot_meta(meta, false);
 	}
 
 	last_addr = addr & PUD_MASK;
@@ -255,9 +259,7 @@ static const struct mm_walk_ops ftier_walk_ops = {
 static void fscan_page_tables_mm(struct mm_struct *mm, pid_t pid)
 {
 	unsigned long start = 0, end = 0x7fffffffffffUL;
-	struct ftier_walk_private priv = {
-			.count = 0, .pudmap = {0}, .pid = pid,
-	};
+	struct ftier_walk_private priv = { .count = 0, .pid = pid };
 	uint64_t start_ns, end_ns;
 
 	start_ns = ktime_get_ns();
@@ -266,8 +268,7 @@ static void fscan_page_tables_mm(struct mm_struct *mm, pid_t pid)
 	mmap_read_unlock(mm);
 	end_ns = ktime_get_ns();
 
-	trace_fscan(pid, __ctx.target.nr_fhot,
-			(end_ns - start_ns) / 1000, priv.pudmap);
+	trace_fscan(pid, __ctx.target.nr_fhot, (end_ns - start_ns) / 1000);
 }
 
 static void fscan_page_tables(void)
@@ -420,7 +421,7 @@ static void do_fspin(void)
 	list_for_each_entry_safe(meta, next, &__ctx.target.fhot_list, siblings) {
 		count_mapped_entries(meta);
 		if (meta->nr_mapped < 5) {
-			destroy_fhot_meta(meta);
+			destroy_fhot_meta(meta, false);
 		} else {
 			args = kzalloc(sizeof(*args), GFP_KERNEL);
 			if (!args)
@@ -565,7 +566,7 @@ int ftier_temptrack_stop(void)
 		while (!list_empty(&__ctx.target.fhot_list)) {
 			meta = list_first_entry(&__ctx.target.fhot_list,
 					struct fhot_meta_gb, siblings);
-			destroy_fhot_meta(meta);
+			destroy_fhot_meta(meta, true);
 		}
 	}
 

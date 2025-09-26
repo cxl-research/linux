@@ -10,31 +10,24 @@
 
 TRACE_EVENT(fscan,
 
-	TP_PROTO(int pid, unsigned int nr_fhot,
-		unsigned int dur_us, unsigned long *pudmap),
+	TP_PROTO(int pid, unsigned int nr_fhot, unsigned int dur_us),
 
-	TP_ARGS(pid, nr_fhot, dur_us, pudmap),
+	TP_ARGS(pid, nr_fhot, dur_us),
 
 	TP_STRUCT__entry(
 		__field(int, pid)
 		__field(unsigned int, nr_fhot)
 		__field(unsigned int, dur_us)
-		__array(unsigned long, pudmap, 8)
 	),
 
 	TP_fast_assign(
 		__entry->pid = pid;
 		__entry->nr_fhot = nr_fhot;
 		__entry->dur_us = dur_us;
-		memcpy(__entry->pudmap, pudmap, sizeof(unsigned long) * 8);
 	),
 
-	TP_printk("pid=%d, nr_fhot=%u, dur=%u us, "
-			"pudmap=[%lx %lx %lx %lx %lx %lx %lx %lx]",
-			__entry->pid, __entry->nr_fhot, __entry->dur_us,
-			__entry->pudmap[0], __entry->pudmap[1], __entry->pudmap[2],
-			__entry->pudmap[3], __entry->pudmap[4], __entry->pudmap[5],
-			__entry->pudmap[6], __entry->pudmap[7])
+	TP_printk("pid=%d, nr_fhot=%u, dur=%u us",
+			__entry->pid, __entry->nr_fhot, __entry->dur_us)
 );
 
 TRACE_EVENT(fspin,

@@ -31,42 +31,47 @@ static void set_tiering_nodes(bool *src_nodes, bool *dst_nodes, bool promote)
 }
 
 static void compute_histogram(struct ftier_target *t,
-		unsigned int *histogram)
+		unsigned int *histogram, bool promote)
 {
 	struct fhot_meta_gb *meta;
-	unsigned int idx, spins, period, opt_period_us;
+	unsigned int idx, spins, period, opt_period_us, cmidx, cmoff;
+	bool oncxl;
 
 	opt_period_us = (sysctl_fscan_period_ms * 1000) / MAX_SPINS;
 	list_for_each_entry(meta, &t->fhot_list, siblings) {
 		period = meta->fspin_period_us;
 		for (idx = 0; idx < 512; ++idx) {
+			cmidx = idx >> 6;
+			cmoff = idx & 0x3f;
+			oncxl = ((meta->cxlmap[cmidx] & (1UL << cmoff)) != 0);
+			if ((oncxl && !promote) || (!oncxl && promote))
+				continue;
+
 			spins = meta->spins[idx];
 			if (period < opt_period_us)
 				spins *= (opt_period_us / period);
-			if (spins <= MAX_SPINS)
-				histogram[(spins - 1)]++;
+			if (spins < MAX_SPINS)
+				histogram[spins]++;
 			else
-				histogram[MAX_SPINS - 1]++;
+				histogram[MAX_SPINS]++;
 		}
 	}
 
-	for (idx = 0; idx < MAX_SPINS; ++idx) {
+	for (idx = 0; idx <= MAX_SPINS; ++idx) {
 		if (histogram[idx])
-			trace_fhist(idx + 1, 2 * histogram[idx]);
+			trace_fhist(idx, 2 * histogram[idx]);
 	}
 }
 
-static unsigned int thresh(unsigned int *histogram,
-		unsigned int promote_pmds)
+static int thresh(unsigned int *histogram, unsigned int promote_pmds)
 {
-	unsigned int sum, idx;
+	int sum, idx;
 
-	promote_pmds = (abs(sysctl_promote_mb) / 2);
 	if (!promote_pmds)
-		return MAX_SPINS; /* disable promotion */
+		return 0; /* disable promotion */
 
 	sum = 0;
-	for (idx = MAX_SPINS - 1; idx >= 0; --idx) {
+	for (idx = MAX_SPINS; idx > 0; --idx) {
 		sum += histogram[idx];
 		if (sum >= promote_pmds)
 			break;
@@ -142,7 +147,7 @@ static int migrate_data(struct mm_struct *mm, unsigned long addr,
 	struct folio *folio;
 	nodemask_t allowed_mask = NODE_MASK_NONE;
 	int nid, nr_remaining, nr_migrated;
-	unsigned int migrated;
+	unsigned int migrated, batchsz;
 	struct migration_target_control mtc = {
 		.gfp_mask = GFP_HIGHUSER_MOVABLE,
 		.nmask = &allowed_mask
@@ -161,11 +166,15 @@ static int migrate_data(struct mm_struct *mm, unsigned long addr,
 
 	walk_page_range(mm, addr, addr + len, &migrate_ops, &args);
 
+	batchsz = 0;
 	while (!list_empty(&args.folio_list)) {
 		folio = lru_to_folio(&args.folio_list);
 		list_move(&folio->lru, &migrate_folios);
-		mtc.nid = nid;
+		++batchsz;
+		if (batchsz < MIGRATE_BATCH && !list_empty(&args.folio_list))
+			continue;
 
+		mtc.nid = nid;
 		nr_remaining = migrate_pages(&migrate_folios,
 				alloc_migrate_folio, NULL, (unsigned long)&mtc,
 				MIGRATE_ASYNC, MR_FTIER, &migrated);
@@ -176,6 +185,7 @@ static int migrate_data(struct mm_struct *mm, unsigned long addr,
 		}
 		nr_migrated += migrated;
 		nid = ftier_next_node(nid, dst_nodes);
+		batchsz = 0;
 	}
 
 	mmap_read_unlock(mm);
@@ -188,9 +198,10 @@ static unsigned int tier_memory(struct ftier_target *t,
 		unsigned int max_pages, unsigned int *histogram)
 {
 	struct fhot_meta_gb *meta;
-	unsigned int mult, hotness, idx, dur_us, nr_pages, opt_period_us;
+	unsigned int mult, hotness, idx, dur_us, nr_pages;
+	unsigned int opt_period_us, cmidx, cmoff;
 	int err, success, failed, nr_pages_success, nr_pages_fail, hidx;
-	bool src_nodes[NR_NODES], dst_nodes[NR_NODES];
+	bool src_nodes[NR_NODES], dst_nodes[NR_NODES], oncxl;
 	uint64_t start_ns, end_ns;
 	unsigned long address;
 
@@ -209,23 +220,35 @@ static unsigned int tier_memory(struct ftier_target *t,
 			mult = (opt_period_us / meta->fspin_period_us);
 
 		for (idx = 0; idx < 512; ++idx) {
+			cmidx = idx >> 6;
+			cmoff = idx & 0x3f;
+			oncxl = ((meta->cxlmap[cmidx] & (1UL << cmoff)) != 0);
+			if ((oncxl && !promote) || (!oncxl && promote))
+				continue;
+
 			hotness = meta->spins[idx] * mult;
 			if (hotness < threshold)
 				continue;
 
-			hidx = max(hotness, MAX_SPINS - 1);
+			hidx = min(hotness, MAX_SPINS);
 			address = meta->address + (idx << PMD_SHIFT);
 			err = migrate_data(meta->mm, address, PMD_SIZE,
 					src_nodes, dst_nodes, &nr_pages);
-			histogram[hidx]--;
 
-			if (err < 0)
+			if (err < 0) {
 				failed++;
-			else {
+			} else {
 				success++;
 				nr_pages_success += err;
 				nr_pages_fail += nr_pages;
-				if (nr_pages_success > max_pages)
+
+				histogram[hidx]--;
+				if (!promote)
+					meta->cxlmap[cmidx] |= (1UL << cmoff);
+				else
+					meta->cxlmap[cmidx] &= ~(1UL << cmoff);
+
+				if (nr_pages_success >= max_pages)
 					goto end;
 			}
 		}
@@ -242,27 +265,29 @@ end:
 void ftier_tier_memory(struct ftier_target *t)
 {
 	unsigned int *histogram;
-	unsigned int threshold, tiered_pages, pmds_to_tier;
-	int maxpages;
+	unsigned int tiered_pages, pmds_to_tier, mb;
+	int maxpages, threshold;
 	bool promote = (sysctl_promote_mb > 0);
 
-	if (sysctl_promote_mb == 0)
+	mb = abs(sysctl_promote_mb);
+	if (mb == 0)
 		return;
 
-	histogram = kzalloc(sizeof(unsigned int) * MAX_SPINS, GFP_KERNEL);
+	histogram = kzalloc(sizeof(unsigned int) * (MAX_SPINS + 1), GFP_KERNEL);
 	if (!histogram)
 		return;
 
-	compute_histogram(t, histogram);
+	compute_histogram(t, histogram, promote);
 
-	pmds_to_tier = abs(sysctl_promote_mb) / 2;
-	maxpages = abs(sysctl_promote_mb) * 256;
+	pmds_to_tier = mb / 2;
+	maxpages = mb * 256;
 	do {
 		threshold = thresh(histogram, pmds_to_tier);
 		tiered_pages = tier_memory(t, threshold, promote,
 				maxpages, histogram);
 		maxpages -= tiered_pages;
-	} while (maxpages > 0 && threshold > 0);
+		pmds_to_tier = (maxpages / 512);
+	} while (pmds_to_tier > 0 && threshold > 0);
 
 	kfree(histogram);
 }

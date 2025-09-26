@@ -48,9 +48,11 @@ struct fhot_meta_gb {
 	unsigned int nr_mapped;
 	struct list_head siblings;
 	unsigned char spins[512];
+	unsigned long cxlmap[8];
 };
 
 #define MAX_SPINS 255 /* max(unsigned char) */
+#define MIGRATE_BATCH 512
 
 struct ftier_target {
 	pid_t pid;
