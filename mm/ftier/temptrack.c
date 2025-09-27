@@ -60,6 +60,18 @@ static inline int decr_ftier_period_us(unsigned int us)
 
 static bool tiering_on = false;
 static bool fspinning = false;
+static bool begin_fspin = false;
+static bool fspin_ended = false;
+static bool update_histogram = false;
+
+static int FSCAN_PERIOD_MS;
+static int FSPIN_PERIOD_MS;
+static int PROMOTE_MB_TICK;
+static int MIN_PMDS_FSPIN;
+static int MAX_FHOT_PC;
+
+static int ms_to_next_fscan = 0;
+static int ms_to_fspin_end = 0;
 
 struct ftier_target *get_target(void)
 {
@@ -354,9 +366,9 @@ static void fspin(struct work_struct *work_args)
 		goto free_out;
 
 	pud = meta->pud;
-	min_hot = sysctl_min_pmds_per_fscan;
-	max_hot = sysctl_max_fhot_pc * meta->nr_mapped / 100;
-	remain_spin_us = sysctl_fspin_ms * 1000;
+	min_hot = MIN_PMDS_FSPIN;
+	max_hot = MAX_FHOT_PC * meta->nr_mapped / 100;
+	remain_spin_us = FSPIN_PERIOD_MS * 1000;
 	fspin_period_us = meta->fspin_period_us;
 	dur_sum_us = 0;
 	nr_spins = 0;
@@ -478,40 +490,95 @@ static bool target_alive(void)
 	return is_alive;
 }
 
+static void commit_sysctl_vals(void)
+{
+	FSCAN_PERIOD_MS = sysctl_fscan_period_ms;
+	FSPIN_PERIOD_MS = sysctl_fspin_ms;
+	PROMOTE_MB_TICK = sysctl_promote_mb;
+	MIN_PMDS_FSPIN = sysctl_min_pmds_per_fscan;
+	MAX_FHOT_PC = sysctl_max_fhot_pc;
+}
+
+static void FSCAN(void)
+{
+	if (ms_to_next_fscan <= 0) {
+		fspin_ended = false;
+		ms_to_next_fscan += FSCAN_PERIOD_MS;
+		fscan_page_tables();
+		begin_fspin = true;
+	}
+}
+
+static void FSPIN_START(void)
+{
+	if (begin_fspin) {
+		begin_fspin = false;
+		do_fspin();
+		fspinning = true;
+		ms_to_fspin_end = FSPIN_PERIOD_MS;
+	}
+}
+
+static void FSPIN_END(void)
+{
+	if (ms_to_fspin_end <= 0) {
+		fspinning = false;
+		flush_workqueue(__ctx.target.wq);
+		ms_to_fspin_end = 0;
+		fspin_ended = true;
+		update_histogram = true;
+	}
+}
+
+static void TIER_MEMORY(int budget_ms)
+{
+	if (budget_ms < MIN_TIER_BUDGET_MS)
+		return;
+
+	if (tiering_on && fspin_ended) {
+		ftier_tier_memory(&__ctx.target, PROMOTE_MB_TICK,
+				(budget_ms * 1000), update_histogram);
+		update_histogram = false;
+	}
+}
+
 static int ftier_fn(void *data)
 {
-	unsigned int fscan_period_ms, fspin_ms, dur_ms;
+	unsigned int dur_ms;
+	int budget_ms;
 	uint64_t start_ns, end_ns;
 
 	while (!kthread_should_stop()) {
 		start_ns = ktime_get_ns();
-		fscan_period_ms = sysctl_fscan_period_ms;
-		fspin_ms = sysctl_fspin_ms;
+		commit_sysctl_vals();
 
 		if (!target_alive())
 			goto end_iter;
 
-		fscan_page_tables();
+		FSCAN();
 
-		fspinning = true;
-		do_fspin();
-		ftier_delay_us(fspin_ms * 1000);
+		FSPIN_START();
 
-		fspinning = false;
-		flush_workqueue(__ctx.target.wq);
+		FSPIN_END();
 
-		if (tiering_on && !kthread_should_stop())
-			ftier_tier_memory(&__ctx.target);
+		end_ns = ktime_get_ns();
+		dur_ms = (end_ns - start_ns) / 1000000;
+		budget_ms = TICK_BUDGET_MS - dur_ms;
+		TIER_MEMORY(budget_ms);
+
+		ms_to_next_fscan -= FTIER_TICK_MS;
+		if (fspinning)
+			ms_to_fspin_end -= FTIER_TICK_MS;
 
 end_iter:
 		end_ns = ktime_get_ns();
 		dur_ms = (end_ns - start_ns) / 1000000;
-		while (dur_ms >= fscan_period_ms)
-			fscan_period_ms *= 2;
-		if (fscan_period_ms > sysctl_fscan_period_ms)
-			pr_info("fscan took too long (%u ms). period increased to %u ms\n",
-					dur_ms, fscan_period_ms);
-		ftier_delay_us((fscan_period_ms - dur_ms) * 1000);
+
+		if (dur_ms > FTIER_TICK_MS) {
+			pr_warn("ftier tick overrun (%u > %u ms)\n", dur_ms, FTIER_TICK_MS);
+			continue;
+		}
+		ftier_delay_us((FTIER_TICK_MS - dur_ms) * 1000);
 	}
 
 	return 0;

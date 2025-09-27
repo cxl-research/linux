@@ -10,10 +10,10 @@
 #include <linux/mutex.h>
 
 enum ftier_status sysctl_ftier_status = FTIER_STATUS_OFF;
-unsigned int sysctl_fscan_period_ms = 10000; /* 10s */
-unsigned int sysctl_fspin_ms = 5000; /* 5s */
-unsigned int sysctl_min_pmds_per_fscan = 3;
-unsigned int sysctl_max_fhot_pc = 60;
+int sysctl_fscan_period_ms = 10000; /* 10s */
+int sysctl_fspin_ms = 5000; /* 5s */
+int sysctl_min_pmds_per_fscan = 3;
+int sysctl_max_fhot_pc = 60;
 int sysctl_promote_mb = 0;
 static DEFINE_MUTEX(ftier_sysctl_lock);
 
@@ -184,14 +184,13 @@ static struct kobj_attribute target_cgroup_attr =
 static ssize_t fscan_period_ms_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%u\n", sysctl_fscan_period_ms);
+	return sysfs_emit(buf, "%d\n", sysctl_fscan_period_ms);
 }
 
 static ssize_t fscan_period_ms_store(struct kobject *kobj,
 		struct kobj_attribute *attr, const char *buf, size_t count)
 {
-	unsigned int period;
-	int err;
+	int period, err;
 
 	err = kstrtoint(buf, 10, &period);
 	if (err || period < 1000 || period > 300000) /* 1s - 5min */
@@ -210,14 +209,13 @@ static struct kobj_attribute fscan_period_ms_attr =
 static ssize_t fspin_ms_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%u\n", sysctl_fspin_ms);
+	return sysfs_emit(buf, "%d\n", sysctl_fspin_ms);
 }
 
 static ssize_t fspin_ms_store(struct kobject *kobj,
 		struct kobj_attribute *attr, const char *buf, size_t count)
 {
-	unsigned int period;
-	int err;
+	int period, err;
 
 	err = kstrtoint(buf, 10, &period);
 	if (err || period < 1000 || period > 60000) /* 1s - 1min */
@@ -236,14 +234,13 @@ static struct kobj_attribute fspin_ms_attr =
 static ssize_t min_pmds_per_fscan_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%u\n", sysctl_min_pmds_per_fscan);
+	return sysfs_emit(buf, "%d\n", sysctl_min_pmds_per_fscan);
 }
 
 static ssize_t min_pmds_per_fscan_store(struct kobject *kobj,
 		struct kobj_attribute *attr, const char *buf, size_t count)
 {
-	unsigned int val;
-	int err;
+	int val, err;
 
 	err = kstrtoint(buf, 10, &val);
 	if (err || val < 1 || val > 100)
@@ -262,14 +259,13 @@ static struct kobj_attribute min_pmds_per_fscan_attr =
 static ssize_t max_fhot_pc_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%u\n", sysctl_max_fhot_pc);
+	return sysfs_emit(buf, "%d\n", sysctl_max_fhot_pc);
 }
 
 static ssize_t max_fhot_pc_store(struct kobject *kobj,
 		struct kobj_attribute *attr, const char *buf, size_t count)
 {
-	unsigned int val;
-	int err;
+	int val, err;
 
 	err = kstrtoint(buf, 10, &val);
 	if (err || val < 1 || val > 100)

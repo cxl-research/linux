@@ -53,6 +53,9 @@ struct fhot_meta_gb {
 
 #define MAX_SPINS 255 /* max(unsigned char) */
 #define MIGRATE_BATCH 512
+#define FTIER_TICK_MS 1000
+#define TICK_BUDGET_MS ((FTIER_TICK_MS) * 9 / 10) /* 90% of tick */
+#define MIN_TIER_BUDGET_MS 100
 
 struct ftier_target {
 	pid_t pid;
@@ -68,17 +71,18 @@ struct ftier_ctx {
 	struct ftier_target target;
 };
 
-extern unsigned int sysctl_fscan_period_ms;
-extern unsigned int sysctl_fspin_ms;
-extern unsigned int sysctl_min_pmds_per_fscan;
-extern unsigned int sysctl_max_fhot_pc;
+extern int sysctl_fscan_period_ms;
+extern int sysctl_fspin_ms;
+extern int sysctl_min_pmds_per_fscan;
+extern int sysctl_max_fhot_pc;
 extern int sysctl_promote_mb;
 
 int ftier_temptrack_start(void);
 int ftier_temptrack_stop(void);
 void ftier_tiering_start(void);
 void ftier_tiering_stop(void);
-void ftier_tier_memory(struct ftier_target *t);
+void ftier_tier_memory(struct ftier_target *t,
+		int promote_mb, int budget_us, bool hist_update);
 
 struct ftier_target *get_target(void);
 int set_target_pid(pid_t pid);

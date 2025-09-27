@@ -194,7 +194,7 @@ static int migrate_data(struct mm_struct *mm, unsigned long addr,
 }
 
 static unsigned int tier_memory(struct ftier_target *t,
-		unsigned int threshold, bool promote,
+		unsigned int threshold, bool promote, int *budget_us,
 		unsigned int max_pages, unsigned int *histogram)
 {
 	struct fhot_meta_gb *meta;
@@ -247,47 +247,57 @@ static unsigned int tier_memory(struct ftier_target *t,
 					meta->cxlmap[cmidx] |= (1UL << cmoff);
 				else
 					meta->cxlmap[cmidx] &= ~(1UL << cmoff);
-
-				if (nr_pages_success >= max_pages)
-					goto end;
 			}
+
+			end_ns = ktime_get_ns();
+			dur_us = (end_ns - start_ns) / 1000;
+			if (dur_us >= (unsigned int)(*budget_us))
+				goto end;
+
+			if (nr_pages_success >= max_pages)
+				goto end;
 		}
 	}
 end:
-	end_ns = ktime_get_ns();
-	dur_us = (end_ns - start_ns) / 1000;
-
 	trace_fmigrate(success, failed, nr_pages_success,
-			nr_pages_fail, dur_us, threshold, promote);
+			nr_pages_fail, *budget_us, dur_us, threshold, promote);
+
+	*budget_us -= dur_us;
 	return nr_pages_success;
 }
 
-void ftier_tier_memory(struct ftier_target *t)
+unsigned int *histogram = NULL;
+
+void ftier_tier_memory(struct ftier_target *t,
+		int promote_mb, int budget_us, bool hist_update)
 {
-	unsigned int *histogram;
 	unsigned int tiered_pages, pmds_to_tier, mb;
 	int maxpages, threshold;
-	bool promote = (sysctl_promote_mb > 0);
+	bool promote = (promote_mb > 0);
+	ssize_t histsz = sizeof(unsigned int) * (MAX_SPINS + 1);
 
-	mb = abs(sysctl_promote_mb);
+	mb = abs(promote_mb);
 	if (mb == 0)
 		return;
 
-	histogram = kzalloc(sizeof(unsigned int) * (MAX_SPINS + 1), GFP_KERNEL);
-	if (!histogram)
-		return;
+	if (hist_update) {
+		if (histogram)
+			memset(histogram, 0, histsz);
+		else
+			histogram = kzalloc(histsz, GFP_KERNEL);
+		if (!histogram)
+			return;
 
-	compute_histogram(t, histogram, promote);
+		compute_histogram(t, histogram, promote);
+	}
 
 	pmds_to_tier = mb / 2;
 	maxpages = mb * 256;
 	do {
 		threshold = thresh(histogram, pmds_to_tier);
 		tiered_pages = tier_memory(t, threshold, promote,
-				maxpages, histogram);
+				&budget_us, maxpages, histogram);
 		maxpages -= tiered_pages;
 		pmds_to_tier = (maxpages / 512);
-	} while (pmds_to_tier > 0 && threshold > 0);
-
-	kfree(histogram);
+	} while (pmds_to_tier > 0 && threshold > 0 && budget_us > 0);
 }
