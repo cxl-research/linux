@@ -171,7 +171,7 @@ static int migrate_data(struct mm_struct *mm, unsigned long addr,
 		folio = lru_to_folio(&args.folio_list);
 		list_move(&folio->lru, &migrate_folios);
 		++batchsz;
-		if (batchsz < MIGRATE_BATCH && !list_empty(&args.folio_list))
+		if (batchsz < sysctl_migrate_batch && !list_empty(&args.folio_list))
 			continue;
 
 		mtc.nid = nid;

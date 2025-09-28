@@ -52,7 +52,6 @@ struct fhot_meta_gb {
 };
 
 #define MAX_SPINS 255 /* max(unsigned char) */
-#define MIGRATE_BATCH 512
 #define FTIER_TICK_MS 1000
 #define TICK_BUDGET_MS ((FTIER_TICK_MS) * 9 / 10) /* 90% of tick */
 #define MIN_TIER_BUDGET_MS 100
@@ -75,6 +74,7 @@ extern int sysctl_fscan_period_ms;
 extern int sysctl_fspin_ms;
 extern int sysctl_min_pmds_per_fscan;
 extern int sysctl_max_fhot_pc;
+extern int sysctl_migrate_batch;
 extern int sysctl_promote_mb;
 
 int ftier_temptrack_start(void);

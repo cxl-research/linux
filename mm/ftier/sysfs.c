@@ -14,9 +14,11 @@ int sysctl_fscan_period_ms = 10000; /* 10s */
 int sysctl_fspin_ms = 5000; /* 5s */
 int sysctl_min_pmds_per_fscan = 3;
 int sysctl_max_fhot_pc = 60;
+int sysctl_migrate_batch = 512;
 int sysctl_promote_mb = 0;
-static DEFINE_MUTEX(ftier_sysctl_lock);
+EXPORT_SYMBOL_GPL(sysctl_promote_mb);
 
+static DEFINE_MUTEX(ftier_sysctl_lock);
 static const char *ftier_status_strs[] = {
 	[FTIER_STATUS_OFF] = "off",
 	[FTIER_STATUS_TRACK] = "tracking",
@@ -281,6 +283,31 @@ static ssize_t max_fhot_pc_store(struct kobject *kobj,
 static struct kobj_attribute max_fhot_pc_attr =
 		__ATTR_RW(max_fhot_pc);
 
+static ssize_t migrate_batch_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", sysctl_migrate_batch);
+}
+
+static ssize_t migrate_batch_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int val, err;
+
+	err = kstrtoint(buf, 10, &val);
+	if (err || val < 1 || val > 512)
+		return -EINVAL;
+
+	mutex_lock(&ftier_sysctl_lock);
+	sysctl_migrate_batch = val;
+	mutex_unlock(&ftier_sysctl_lock);
+
+	return count;
+}
+
+static struct kobj_attribute migrate_batch_attr =
+		__ATTR_RW(migrate_batch);
+
 static ssize_t promote_mb_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
@@ -314,6 +341,7 @@ static struct attribute *ftier_sysfs_attrs[] = {
 	&fspin_ms_attr.attr,
 	&min_pmds_per_fscan_attr.attr,
 	&max_fhot_pc_attr.attr,
+	&migrate_batch_attr.attr,
 	&promote_mb_attr.attr,
 	NULL,
 };
