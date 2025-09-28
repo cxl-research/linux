@@ -88,7 +88,7 @@ TRACE_EVENT(fhist,
 TRACE_EVENT(fmigrate,
 
 	TP_PROTO(int succ, int fail, int succpg, int failpg, int budget_us,
-			unsigned int dur_us, unsigned int thresh, bool promote),
+			int dur_us, unsigned int thresh, bool promote),
 
 	TP_ARGS(succ, fail, succpg, failpg, budget_us, dur_us, thresh, promote),
 
@@ -98,7 +98,7 @@ TRACE_EVENT(fmigrate,
 		__field(int, succpg)
 		__field(int, failpg)
 		__field(int, budget_us)
-		__field(unsigned int, dur_us)
+		__field(int, dur_us)
 		__field(unsigned int, thresh)
 		__field(bool, promote)
 	),
@@ -115,7 +115,7 @@ TRACE_EVENT(fmigrate,
 	),
 
 	TP_printk("succ=%d, fail=%d, succpg=%d, failpg=%d,"
-						" budget_us=%d, dur_us=%u, thresh=%u, promote=%d",
+						" budget_us=%d, dur_us=%d, thresh=%u, promote=%d",
 			__entry->succ, __entry->fail, __entry->succpg,
 			__entry->failpg, __entry->budget_us, __entry->dur_us,
 			__entry->thresh, __entry->promote)

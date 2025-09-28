@@ -73,6 +73,10 @@ static int MAX_FHOT_PC;
 static int ms_to_next_fscan = 0;
 static int ms_to_fspin_end = 0;
 
+static int fscans_completed = 0;
+static int fspins_completed = 0;
+static int ticks_completed = 0;
+
 struct ftier_target *get_target(void)
 {
 	return &__ctx.target;
@@ -415,9 +419,10 @@ static void fspin(struct work_struct *work_args)
 		ftier_delay_us(fspin_period_us - dur_us);
 		remain_spin_us -= fspin_period_us;
 	} while ((remain_spin_us > 0) && (nr_spins < MAX_SPINS));
+	mmput(mm);
 
 	meta->fspin_period_us = fspin_period_us;
-	mmput(mm);
+	memcpy(meta->oldspins, meta->spins, sizeof(meta->spins));
 free_out:
 	kfree(args);
 
@@ -506,6 +511,7 @@ static void FSCAN(void)
 		ms_to_next_fscan += FSCAN_PERIOD_MS;
 		fscan_page_tables();
 		begin_fspin = true;
+		fscans_completed++;
 	}
 }
 
@@ -521,12 +527,13 @@ static void FSPIN_START(void)
 
 static void FSPIN_END(void)
 {
-	if (ms_to_fspin_end <= 0) {
+	if (fspinning && ms_to_fspin_end <= 0) {
 		fspinning = false;
 		flush_workqueue(__ctx.target.wq);
 		ms_to_fspin_end = 0;
 		fspin_ended = true;
 		update_histogram = true;
+		fspins_completed++;
 	}
 }
 
@@ -535,7 +542,7 @@ static void TIER_MEMORY(int budget_ms)
 	if (budget_ms < MIN_TIER_BUDGET_MS)
 		return;
 
-	if (tiering_on && fspin_ended) {
+	if (tiering_on && fspins_completed) {
 		ftier_tier_memory(&__ctx.target, PROMOTE_MB_TICK,
 				(budget_ms * 1000), update_histogram);
 		update_histogram = false;
@@ -578,6 +585,7 @@ end_iter:
 			pr_warn("ftier tick overrun (%u > %u ms)\n", dur_ms, FTIER_TICK_MS);
 			continue;
 		}
+		ticks_completed++;
 		ftier_delay_us((FTIER_TICK_MS - dur_ms) * 1000);
 	}
 

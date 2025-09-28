@@ -48,6 +48,7 @@ struct fhot_meta_gb {
 	unsigned int nr_mapped;
 	struct list_head siblings;
 	unsigned char spins[512];
+	unsigned char oldspins[512];
 	unsigned long cxlmap[8];
 };
 

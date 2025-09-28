@@ -47,7 +47,7 @@ static void compute_histogram(struct ftier_target *t,
 			if ((oncxl && !promote) || (!oncxl && promote))
 				continue;
 
-			spins = meta->spins[idx];
+			spins = meta->oldspins[idx];
 			if (period < opt_period_us)
 				spins *= (opt_period_us / period);
 			if (spins < MAX_SPINS)
@@ -198,9 +198,10 @@ static unsigned int tier_memory(struct ftier_target *t,
 		unsigned int max_pages, unsigned int *histogram)
 {
 	struct fhot_meta_gb *meta;
-	unsigned int mult, hotness, idx, dur_us, nr_pages;
+	unsigned int mult, hotness, idx, nr_pages;
 	unsigned int opt_period_us, cmidx, cmoff;
-	int err, success, failed, nr_pages_success, nr_pages_fail, hidx;
+	int err, success, failed, nr_pages_success;
+	int nr_pages_fail, hidx, dur_us;
 	bool src_nodes[NR_NODES], dst_nodes[NR_NODES], oncxl;
 	uint64_t start_ns, end_ns;
 	unsigned long address;
@@ -214,6 +215,9 @@ static unsigned int tier_memory(struct ftier_target *t,
 	opt_period_us = (sysctl_fscan_period_ms * 1000) / MAX_SPINS;
 
 	start_ns = ktime_get_ns();
+	end_ns = start_ns;
+	dur_us = 0;
+
 	list_for_each_entry(meta, &t->fhot_list, siblings) {
 		mult = 1;
 		if (meta->fspin_period_us < opt_period_us)
@@ -226,7 +230,7 @@ static unsigned int tier_memory(struct ftier_target *t,
 			if ((oncxl && !promote) || (!oncxl && promote))
 				continue;
 
-			hotness = meta->spins[idx] * mult;
+			hotness = meta->oldspins[idx] * mult;
 			if (hotness < threshold)
 				continue;
 
@@ -251,13 +255,14 @@ static unsigned int tier_memory(struct ftier_target *t,
 
 			end_ns = ktime_get_ns();
 			dur_us = (end_ns - start_ns) / 1000;
-			if (dur_us >= (unsigned int)(*budget_us))
+			if (dur_us >= *budget_us)
 				goto end;
 
 			if (nr_pages_success >= max_pages)
 				goto end;
 		}
 	}
+
 end:
 	trace_fmigrate(success, failed, nr_pages_success,
 			nr_pages_fail, *budget_us, dur_us, threshold, promote);
@@ -272,7 +277,7 @@ void ftier_tier_memory(struct ftier_target *t,
 		int promote_mb, int budget_us, bool hist_update)
 {
 	unsigned int tiered_pages, pmds_to_tier, mb;
-	int maxpages, threshold;
+	int maxpages, threshold, max_failed_tries = 5;
 	bool promote = (promote_mb > 0);
 	ssize_t histsz = sizeof(unsigned int) * (MAX_SPINS + 1);
 
@@ -297,7 +302,11 @@ void ftier_tier_memory(struct ftier_target *t,
 		threshold = thresh(histogram, pmds_to_tier);
 		tiered_pages = tier_memory(t, threshold, promote,
 				&budget_us, maxpages, histogram);
+		if (!tiered_pages)
+			max_failed_tries--;
+
 		maxpages -= tiered_pages;
 		pmds_to_tier = (maxpages / 512);
-	} while (pmds_to_tier > 0 && threshold > 0 && budget_us > 0);
+	} while (pmds_to_tier > 0 && threshold > 0 &&
+			budget_us > 0 && max_failed_tries > 0);
 }
