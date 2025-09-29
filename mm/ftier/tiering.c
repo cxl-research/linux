@@ -9,9 +9,13 @@
 #include <linux/ftier.h>
 #include <linux/pagewalk.h>
 
+#include <asm-generic/tlb.h>
+
 #include "../internal.h"
 
 #include <trace/events/ftier.h>
+
+static enum ftier_tiering_mode TIERING_MODE;
 
 static void set_tiering_nodes(bool *src_nodes, bool *dst_nodes, bool promote)
 {
@@ -162,8 +166,6 @@ static int migrate_data(struct mm_struct *mm, unsigned long addr,
 	args.src_nodes = src_nodes;
 	INIT_LIST_HEAD(&args.folio_list);
 
-	mmap_read_lock(mm);
-
 	walk_page_range(mm, addr, addr + len, &migrate_ops, &args);
 
 	batchsz = 0;
@@ -188,9 +190,120 @@ static int migrate_data(struct mm_struct *mm, unsigned long addr,
 		batchsz = 0;
 	}
 
-	mmap_read_unlock(mm);
-
 	return nr_migrated;
+}
+
+static int change_pte_range(struct mmu_gather *tlb,
+		struct vm_area_struct *vma, pmd_t *pmd, unsigned long addr,
+		unsigned long end, bool *src_nodes)
+{
+	pte_t *pte, oldpte, newpte;
+	spinlock_t *ptl;
+	struct folio *folio;
+	int pages = 0;
+	int nid;
+
+	tlb_change_page_size(tlb, PAGE_SIZE);
+	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+	if (!pte)
+		return -EAGAIN;
+
+	flush_tlb_batched_pending(vma->vm_mm);
+	arch_enter_lazy_mmu_mode();
+	do {
+		oldpte = ptep_get(pte);
+		if (!pte_present(oldpte))
+			continue;
+
+		if (pte_protnone(oldpte))
+			continue;
+
+		folio = vm_normal_folio(vma, addr, oldpte);
+		if (!folio || folio_is_zone_device(folio) ||
+		    folio_test_ksm(folio))
+			continue;
+
+		/* Also skip shared copy-on-write pages */
+		if (is_cow_mapping(vma->vm_flags) &&
+		    (folio_maybe_dma_pinned(folio) ||
+		     folio_maybe_mapped_shared(folio)))
+			continue;
+
+		if (folio_is_file_lru(folio) && folio_test_dirty(folio))
+			continue;
+
+		nid = folio_nid(folio);
+		if (!src_nodes[nid])
+			continue;
+
+		if (folio_use_access_time(folio))
+			folio_xchg_access_time(folio, jiffies_to_msecs(jiffies));
+
+		oldpte = ptep_modify_prot_start(vma, addr, pte);
+		newpte = pte_modify(oldpte, PAGE_NONE);
+		ptep_modify_prot_commit(vma, addr, pte, oldpte, newpte);
+		if (pte_needs_flush(oldpte, newpte))
+			tlb_flush_pte_range(tlb, addr, PAGE_SIZE);
+		pages++;
+	} while (pte++, addr += PAGE_SIZE, addr != end);
+
+	arch_leave_lazy_mmu_mode();
+	pte_unmap_unlock(pte, ptl);
+	return pages;
+}
+
+static int change_pmd_range(struct fhot_meta_gb *meta,
+		unsigned long addr, unsigned long len, bool *src_nodes)
+{
+	unsigned long next, end;
+	int ret, pages;
+	struct mmu_gather tlb;
+	struct vm_area_struct *vma;
+	struct mm_struct *mm = meta->mm;
+	pud_t *pud = meta->pud;
+	pmd_t *pmd, _pmd;
+
+	pages = 0;
+	end = addr + len;
+	vma = find_vma(mm, addr);
+	if (!vma || addr < vma->vm_start)
+		return -EINVAL;
+
+	if (!vma_migratable(vma) || !vma_policy_mof(vma) ||
+			is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_MIXEDMAP))
+		return -EINVAL;
+
+	if (!vma_is_accessible(vma) || !vma->vm_mm || vma->vm_mm != mm ||
+			(vma->vm_file && (vma->vm_flags & (VM_READ|VM_WRITE)) == (VM_READ)))
+		return -EINVAL;
+
+	tlb_gather_mmu(&tlb, mm);
+
+	pmd = pmd_offset(pud, addr);
+	do {
+again:
+		next = pmd_addr_end(addr, end);
+		if (pmd_none(*pmd))
+			continue;
+
+		_pmd = pmdp_get_lockless(pmd);
+		if (is_swap_pmd(_pmd) || pmd_trans_huge(_pmd) || pmd_devmap(_pmd))
+			continue;
+
+		ret = change_pte_range(&tlb, vma, pmd, addr, next, src_nodes);
+		if (ret < 0)
+			goto again;
+
+		pages += ret;
+	} while (pmd++, addr = next, addr != end);
+
+	tlb_finish_mmu(&tlb);
+	if (pages > 0) {
+		count_vm_numa_events(NUMA_PTE_UPDATES, pages);
+		count_memcg_events_mm(mm, NUMA_PTE_UPDATES, pages);
+	}
+
+	return pages;
 }
 
 static unsigned int tier_memory(struct ftier_target *t,
@@ -236,8 +349,22 @@ static unsigned int tier_memory(struct ftier_target *t,
 
 			hidx = min(hotness, MAX_SPINS);
 			address = meta->address + (idx << PMD_SHIFT);
-			err = migrate_data(meta->mm, address, PMD_SIZE,
-					src_nodes, dst_nodes, &nr_pages);
+
+			mmap_read_lock(meta->mm);
+
+			switch (TIERING_MODE) {
+				case DEMAND_MIGRATE:
+				err = migrate_data(meta->mm, address, PMD_SIZE,
+						src_nodes, dst_nodes, &nr_pages);
+				break;
+				case HINT_FAULT:
+					err = change_pmd_range(meta, address, PMD_SIZE, src_nodes);
+				break;
+				default:
+					err = -EINVAL;
+			}
+
+			mmap_read_unlock(meta->mm);
 
 			if (err < 0) {
 				failed++;
@@ -248,9 +375,11 @@ static unsigned int tier_memory(struct ftier_target *t,
 
 				histogram[hidx]--;
 				if (!promote)
-					meta->cxlmap[cmidx] |= (1UL << cmoff);
+					meta->cxlmap[cmidx] |=
+						(1UL << cmoff);
 				else
-					meta->cxlmap[cmidx] &= ~(1UL << cmoff);
+					meta->cxlmap[cmidx] &=
+						~(1UL << cmoff);
 			}
 
 			end_ns = ktime_get_ns();
@@ -285,6 +414,7 @@ void ftier_tier_memory(struct ftier_target *t,
 	if (mb == 0)
 		return;
 
+	TIERING_MODE = sysctl_tiering_mode;
 	if (hist_update) {
 		if (histogram)
 			memset(histogram, 0, histsz);

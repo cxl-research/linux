@@ -76,6 +76,7 @@
 #include <linux/ptrace.h>
 #include <linux/vmalloc.h>
 #include <linux/sched/sysctl.h>
+#include <linux/ftier.h>
 
 #include <trace/events/kmem.h>
 
@@ -5735,6 +5736,46 @@ static vm_fault_t do_fault(struct vm_fault *vmf)
 	return ret;
 }
 
+static int ftier_hint_fault_latency(struct folio *folio)
+{
+	int last_time, time;
+	time = jiffies_to_msecs(jiffies);
+	last_time = folio_xchg_access_time(folio, time);
+	return (time - last_time) & PAGE_ACCESS_TIME_MASK;
+}
+
+static int ftier_migrate_check(struct folio *folio)
+{
+	int idx, src_nid, latency;
+	static int target_nid = 0;
+	bool promote;
+
+	if (!sysctl_promote_mb)
+		return NUMA_NO_NODE;
+
+	src_nid = folio_nid(folio);
+	promote = (sysctl_promote_mb > 0);
+	if ((promote && DRAM_NID(src_nid)) && (!promote && CXL_NID(src_nid)))
+		return NUMA_NO_NODE;
+
+	latency = ftier_hint_fault_latency(folio);
+	if (latency >= sysctl_hint_fault_latency_threshold_ms)
+		return NUMA_NO_NODE;
+
+	for (idx = 0; idx < NR_NODES; idx++) {
+		target_nid = (target_nid + 1) % NR_NODES;
+		if (!promote && CXL_NID(target_nid))
+			break;
+		if (promote && DRAM_NID(target_nid))
+			break;
+	}
+
+	if (idx == NR_NODES)
+		return NUMA_NO_NODE;
+
+	return target_nid;
+}
+
 int numa_migrate_check(struct folio *folio, struct vm_fault *vmf,
 		      unsigned long addr, int *flags,
 		      bool writable, int *last_cpupid)
@@ -5778,6 +5819,10 @@ int numa_migrate_check(struct folio *folio, struct vm_fault *vmf,
 		count_vm_numa_event(NUMA_HINT_FAULTS_LOCAL);
 		*flags |= TNF_FAULT_LOCAL;
 	}
+
+	/* FTier Check */
+	if (sysctl_tiering_mode == HINT_FAULT)
+		return ftier_migrate_check(folio);
 
 	return mpol_misplaced(folio, vmf, addr);
 }

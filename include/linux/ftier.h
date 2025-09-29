@@ -39,6 +39,12 @@ enum ftier_target_type {
 	NR_FTIER_TARGET_TYPES,
 };
 
+enum ftier_tiering_mode {
+	DEMAND_MIGRATE,
+	HINT_FAULT,
+	NR_FTIER_TIERING_MODES,
+};
+
 struct fhot_meta_gb {
 	pud_t *pud;
 	pid_t pid;
@@ -76,7 +82,9 @@ extern int sysctl_fspin_ms;
 extern int sysctl_min_pmds_per_fscan;
 extern int sysctl_max_fhot_pc;
 extern int sysctl_migrate_batch;
+extern int sysctl_hint_fault_latency_threshold_ms;
 extern int sysctl_promote_mb;
+extern enum ftier_tiering_mode sysctl_tiering_mode;
 
 int ftier_temptrack_start(void);
 int ftier_temptrack_stop(void);

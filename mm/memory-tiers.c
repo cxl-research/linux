@@ -7,6 +7,7 @@
 #include <linux/memory-tiers.h>
 #include <linux/notifier.h>
 #include <linux/sched/sysctl.h>
+#include <linux/ftier.h>
 
 #include "internal.h"
 
@@ -62,11 +63,19 @@ static const struct bus_type memory_tier_subsys = {
  *
  * Return: the folio _last_cpupid is used to record page access time
  */
+#ifdef CONFIG_FTIER_TIER_MEM
+bool folio_use_access_time(struct folio *folio)
+{
+	int nid = folio_nid(folio);
+	return (DRAM_NID(nid) || CXL_NID(nid));
+}
+#else
 bool folio_use_access_time(struct folio *folio)
 {
 	return (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) &&
 	       !node_is_toptier(folio_nid(folio));
 }
+#endif
 #endif
 
 #ifdef CONFIG_MIGRATION
