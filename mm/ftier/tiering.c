@@ -260,7 +260,9 @@ static int change_pmd_range(struct fhot_meta_gb *meta,
 	struct mmu_gather tlb;
 	struct vm_area_struct *vma;
 	struct mm_struct *mm = meta->mm;
-	pud_t *pud = meta->pud;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
 	pmd_t *pmd, _pmd;
 
 	pages = 0;
@@ -279,7 +281,22 @@ static int change_pmd_range(struct fhot_meta_gb *meta,
 
 	tlb_gather_mmu(&tlb, mm);
 
+	pgd = pgd_offset(mm, addr);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		goto finish_mmu;
+
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		goto finish_mmu;
+
+	pud = pud_offset(p4d, addr);
+	if (pud_none(*pud) || pud_bad(*pud))
+		goto finish_mmu;
+
 	pmd = pmd_offset(pud, addr);
+	if (pmd_none(*pmd) || pmd_bad(*pmd))
+		goto finish_mmu;
+
 	do {
 again:
 		next = pmd_addr_end(addr, end);
@@ -297,6 +314,7 @@ again:
 		pages += ret;
 	} while (pmd++, addr = next, addr != end);
 
+finish_mmu:
 	tlb_finish_mmu(&tlb);
 	if (pages > 0) {
 		count_vm_numa_events(NUMA_PTE_UPDATES, pages);
@@ -325,6 +343,7 @@ static unsigned int tier_memory(struct ftier_target *t,
 	failed = 0;
 	nr_pages_success = 0;
 	nr_pages_fail = 0;
+	nr_pages = 0;
 	opt_period_us = (sysctl_fscan_period_ms * 1000) / MAX_SPINS;
 
 	start_ns = ktime_get_ns();

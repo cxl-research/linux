@@ -110,7 +110,7 @@ static struct fhot_meta_gb * find_fhot_meta(struct mm_struct *mm,
 }
 
 static void alloc_fhot_meta(struct mm_struct *mm,
-		pud_t *pud, pid_t pid, unsigned long addr)
+		pid_t pid, unsigned long addr)
 {
 	struct fhot_meta_gb *meta;
 
@@ -120,7 +120,6 @@ static void alloc_fhot_meta(struct mm_struct *mm,
 
 	meta->pid = pid;
 	meta->mm = mm;
-	meta->pud = pud;
 	meta->address = addr & PUD_MASK;
 	meta->fspin_period_us = 20000; /* 20ms */
 
@@ -252,7 +251,7 @@ static int fscan(pud_t *pud, unsigned long addr,
 		priv->count++;
 		meta = find_fhot_meta(walk->mm, pid, addr);
 		if (!meta)
-			alloc_fhot_meta(walk->mm, pud, pid, addr);
+			alloc_fhot_meta(walk->mm, pid, addr);
 		else
 			reset_spins(meta);
 	} else {
@@ -326,14 +325,34 @@ static void fscan_page_tables(void)
 
 static void count_mapped_entries(struct fhot_meta_gb *meta)
 {
-	pud_t *pud = meta->pud;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
 	pmd_t *pmd;
 	unsigned long addr, next, end;
 	unsigned int nr_mapped = 0;
 
 	addr = meta->address;
 	end = addr + PUD_SIZE;
+
+	mmap_read_lock(meta->mm);
+
+	pgd = pgd_offset(meta->mm, addr);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		goto unlock;
+
+	p4d = p4d_offset(pgd, addr);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		goto unlock;
+
+	pud = pud_offset(p4d, addr);
+	if (pud_none(*pud) || pud_bad(*pud))
+		goto unlock;
+
 	pmd = pmd_offset(pud, addr);
+	if (pmd_none(*pmd) || pmd_bad(*pmd))
+		goto unlock;
+
 	do {
 		next = pmd_addr_end(addr, end);
 		if (pmd_present(*pmd))
@@ -341,6 +360,8 @@ static void count_mapped_entries(struct fhot_meta_gb *meta)
 		addr = next;
 		pmd++;
 	} while (pmd++, addr = next, addr < end);
+unlock:
+	mmap_read_unlock(meta->mm);
 
 	meta->nr_mapped = nr_mapped;
 }
@@ -352,6 +373,8 @@ struct fspin_args {
 
 static void fspin(struct work_struct *work_args)
 {
+	pgd_t *pgd;
+	p4d_t *p4d;
 	pud_t *pud;
 	pmd_t *pmd;
 	struct mm_struct *mm;
@@ -369,7 +392,6 @@ static void fspin(struct work_struct *work_args)
 	if (!mm)
 		goto free_out;
 
-	pud = meta->pud;
 	min_hot = MIN_PMDS_FSPIN;
 	max_hot = MAX_FHOT_PC * meta->nr_mapped / 100;
 	remain_spin_us = FSPIN_PERIOD_MS * 1000;
@@ -383,12 +405,30 @@ static void fspin(struct work_struct *work_args)
 		nr_hot = 0;
 		addr = meta->address;
 		end = addr + PUD_SIZE;
-		pmd = pmd_offset(pud, addr);
 
 		if (!fspinning)
 			break;
 
 		start_ns = ktime_get_ns();
+
+		mmap_read_lock(mm);
+
+		pgd = pgd_offset(mm, addr);
+		if (pgd_none(*pgd) || pgd_bad(*pgd))
+			goto unlock;
+
+		p4d = p4d_offset(pgd, addr);
+		if (p4d_none(*p4d) || p4d_bad(*p4d))
+			goto unlock;
+
+		pud = pud_offset(p4d, addr);
+		if (pud_none(*pud) || pud_bad(*pud))
+			goto unlock;
+
+		pmd = pmd_offset(pud, addr);
+		if (pmd_none(*pmd) || pmd_bad(*pmd))
+			goto unlock;
+
 		do {
 			next = pmd_addr_end(addr, end);
 			if (!pmd_present(*pmd))
@@ -400,8 +440,10 @@ static void fspin(struct work_struct *work_args)
 				meta->spins[pmd_idx]++;
 			}
 		} while (pmd++, addr = next, addr < end);
-		end_ns = ktime_get_ns();
+unlock:
+		mmap_read_unlock(mm);
 
+		end_ns = ktime_get_ns();
 		dur_us = (end_ns - start_ns) / 1000;
 		dur_sum_us += dur_us;
 		sum_hot += nr_hot;
