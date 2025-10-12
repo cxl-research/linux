@@ -47,7 +47,6 @@ enum ftier_tiering_mode {
 
 struct fhot_meta_gb {
 	pid_t pid;
-	struct mm_struct *mm;
 	unsigned long address;
 	unsigned int fspin_period_us;
 	unsigned int nr_mapped;

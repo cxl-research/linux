@@ -71,7 +71,7 @@ static int thresh(unsigned int *histogram, unsigned int promote_pmds)
 {
 	int sum, idx;
 
-	if (!promote_pmds)
+	if (!histogram || !promote_pmds)
 		return 0; /* disable promotion */
 
 	sum = 0;
@@ -259,25 +259,40 @@ static int change_pmd_range(struct fhot_meta_gb *meta,
 	int ret, pages;
 	struct mmu_gather tlb;
 	struct vm_area_struct *vma;
-	struct mm_struct *mm = meta->mm;
+	struct task_struct *task;
+	struct mm_struct *mm;
 	pgd_t *pgd;
 	p4d_t *p4d;
 	pud_t *pud;
 	pmd_t *pmd, _pmd;
 
+	task = find_task_by_vpid(meta->pid);
+	if (!task || task->flags & PF_EXITING)
+		return -EINVAL;
+
+	mm = get_task_mm(task);
+	if (!mm)
+		return -EINVAL;
+
 	pages = 0;
 	end = addr + len;
 	vma = find_vma(mm, addr);
-	if (!vma || addr < vma->vm_start)
+	if (!vma || addr < vma->vm_start) {
+		mmput(mm);
 		return -EINVAL;
+	}
 
 	if (!vma_migratable(vma) || !vma_policy_mof(vma) ||
-			is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_MIXEDMAP))
+			is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_MIXEDMAP)) {
+		mmput(mm);
 		return -EINVAL;
+	}
 
 	if (!vma_is_accessible(vma) || !vma->vm_mm || vma->vm_mm != mm ||
-			(vma->vm_file && (vma->vm_flags & (VM_READ|VM_WRITE)) == (VM_READ)))
+			(vma->vm_file && (vma->vm_flags & (VM_READ|VM_WRITE)) == (VM_READ))) {
+		mmput(mm);
 		return -EINVAL;
+	}
 
 	tlb_gather_mmu(&tlb, mm);
 
@@ -316,6 +331,7 @@ again:
 
 finish_mmu:
 	tlb_finish_mmu(&tlb);
+	mmput(mm);
 	if (pages > 0) {
 		count_vm_numa_events(NUMA_PTE_UPDATES, pages);
 		count_memcg_events_mm(mm, NUMA_PTE_UPDATES, pages);
@@ -329,6 +345,8 @@ static unsigned int tier_memory(struct ftier_target *t,
 		unsigned int max_pages, unsigned int *histogram)
 {
 	struct fhot_meta_gb *meta;
+	struct task_struct *task;
+	struct mm_struct *mm;
 	unsigned int mult, hotness, idx, nr_pages;
 	unsigned int opt_period_us, cmidx, cmoff;
 	int err, success, failed, nr_pages_success;
@@ -355,6 +373,10 @@ static unsigned int tier_memory(struct ftier_target *t,
 		if (meta->fspin_period_us < opt_period_us)
 			mult = (opt_period_us / meta->fspin_period_us);
 
+		task = find_task_by_vpid(meta->pid);
+		if (!task || task->flags & PF_EXITING)
+			goto end;
+
 		for (idx = 0; idx < 512; ++idx) {
 			cmidx = idx >> 6;
 			cmoff = idx & 0x3f;
@@ -369,11 +391,15 @@ static unsigned int tier_memory(struct ftier_target *t,
 			hidx = min(hotness, MAX_SPINS);
 			address = meta->address + (idx << PMD_SHIFT);
 
-			mmap_read_lock(meta->mm);
+			mm = get_task_mm(task);
+			if (!mm)
+				goto end;
+
+			mmap_read_lock(mm);
 
 			switch (TIERING_MODE) {
 				case DEMAND_MIGRATE:
-				err = migrate_data(meta->mm, address, PMD_SIZE,
+				err = migrate_data(mm, address, PMD_SIZE,
 						src_nodes, dst_nodes, &nr_pages);
 				break;
 				case HINT_FAULT:
@@ -383,7 +409,8 @@ static unsigned int tier_memory(struct ftier_target *t,
 					err = -EINVAL;
 			}
 
-			mmap_read_unlock(meta->mm);
+			mmap_read_unlock(mm);
+			mmput(mm);
 
 			if (err < 0) {
 				failed++;
@@ -444,6 +471,9 @@ void ftier_tier_memory(struct ftier_target *t,
 
 		compute_histogram(t, histogram, promote);
 	}
+
+	if (!histogram)
+		return;
 
 	pmds_to_tier = mb / 2;
 	maxpages = mb * 256;

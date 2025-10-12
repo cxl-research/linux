@@ -97,20 +97,17 @@ static inline void reset_spins(struct fhot_meta_gb *meta)
 	memset(meta->spins, 0, sizeof(meta->spins));
 }
 
-static struct fhot_meta_gb * find_fhot_meta(struct mm_struct *mm,
-		pid_t pid, unsigned long addr)
+static struct fhot_meta_gb * find_fhot_meta(pid_t pid, unsigned long addr)
 {
 	struct fhot_meta_gb *meta;
 	list_for_each_entry(meta, &__ctx.target.fhot_list, siblings) {
-		if ((meta->address == (addr & PUD_MASK)) &&
-				(meta->mm == mm) && (meta->pid == pid))
+		if ((meta->address == (addr & PUD_MASK)) && (meta->pid == pid))
 			return meta;
 	}
 	return NULL;
 }
 
-static void alloc_fhot_meta(struct mm_struct *mm,
-		pid_t pid, unsigned long addr)
+static void alloc_fhot_meta(pid_t pid, unsigned long addr)
 {
 	struct fhot_meta_gb *meta;
 
@@ -119,7 +116,6 @@ static void alloc_fhot_meta(struct mm_struct *mm,
 		return;
 
 	meta->pid = pid;
-	meta->mm = mm;
 	meta->address = addr & PUD_MASK;
 	meta->fspin_period_us = 20000; /* 20ms */
 
@@ -145,6 +141,15 @@ static void destroy_fhot_meta(struct fhot_meta_gb *meta, bool force)
 	list_del(&meta->siblings);
 	kfree(meta);
 	__ctx.target.nr_fhot--;
+}
+
+static void destroy_all_meta(pid_t pid)
+{
+	struct fhot_meta_gb *meta, *tmp;
+	list_for_each_entry_safe(meta, tmp, &__ctx.target.fhot_list, siblings) {
+		if (meta->pid == pid)
+			destroy_fhot_meta(meta, true);
+	}
 }
 
 int set_target_cgroup(const char *path)
@@ -249,13 +254,13 @@ static int fscan(pud_t *pud, unsigned long addr,
 	if (pud_young(*pud)) {
 		pudp_clear_young_notify(walk->mm, addr, pud);
 		priv->count++;
-		meta = find_fhot_meta(walk->mm, pid, addr);
+		meta = find_fhot_meta(pid, addr);
 		if (!meta)
-			alloc_fhot_meta(walk->mm, pid, addr);
+			alloc_fhot_meta(pid, addr);
 		else
 			reset_spins(meta);
 	} else {
-		meta = find_fhot_meta(walk->mm, pid, addr);
+		meta = find_fhot_meta(pid, addr);
 		if (meta)
 			destroy_fhot_meta(meta, false);
 	}
@@ -317,6 +322,8 @@ static void fscan_page_tables(void)
 			if (mm) {
 				fscan_page_tables_mm(mm, task->pid);
 				mmput(mm);
+			} else {
+				destroy_all_meta(task->pid);
 			}
 		}
 		css_task_iter_end(&it);
@@ -328,16 +335,24 @@ static void count_mapped_entries(struct fhot_meta_gb *meta)
 	pgd_t *pgd;
 	p4d_t *p4d;
 	pud_t *pud;
-	pmd_t *pmd;
+	pmd_t *pmd, _pmd;
+	struct task_struct *task;
+	struct mm_struct *mm;
 	unsigned long addr, next, end;
 	unsigned int nr_mapped = 0;
 
 	addr = meta->address;
 	end = addr + PUD_SIZE;
 
-	mmap_read_lock(meta->mm);
+	task = find_task_by_vpid(meta->pid);
+	if (!task || task->flags & PF_EXITING)
+		goto exit_destroy_meta;
 
-	pgd = pgd_offset(meta->mm, addr);
+	mm = get_task_mm(task);
+	if (!mm)
+		goto exit_destroy_meta;
+
+	pgd = pgd_offset(mm, addr);
 	if (pgd_none(*pgd) || pgd_bad(*pgd))
 		goto unlock;
 
@@ -350,20 +365,25 @@ static void count_mapped_entries(struct fhot_meta_gb *meta)
 		goto unlock;
 
 	pmd = pmd_offset(pud, addr);
-	if (pmd_none(*pmd) || pmd_bad(*pmd))
-		goto unlock;
 
 	do {
 		next = pmd_addr_end(addr, end);
-		if (pmd_present(*pmd))
-			nr_mapped++;
-		addr = next;
-		pmd++;
+
+		if (pmd_none(*pmd))
+			continue;
+
+		_pmd = pmdp_get_lockless(pmd);
+		if (is_swap_pmd(_pmd) || pmd_trans_huge(_pmd) || pmd_devmap(_pmd))
+			continue;
+
+		nr_mapped++;
 	} while (pmd++, addr = next, addr < end);
 unlock:
-	mmap_read_unlock(meta->mm);
-
+	mmput(mm);
 	meta->nr_mapped = nr_mapped;
+	return;
+exit_destroy_meta:
+	destroy_fhot_meta(meta, true);
 }
 
 struct fspin_args {
@@ -376,7 +396,8 @@ static void fspin(struct work_struct *work_args)
 	pgd_t *pgd;
 	p4d_t *p4d;
 	pud_t *pud;
-	pmd_t *pmd;
+	pmd_t *pmd, _pmd;
+	struct task_struct *task;
 	struct mm_struct *mm;
 	struct fhot_meta_gb *meta;
 	struct fspin_args *args;
@@ -387,9 +408,9 @@ static void fspin(struct work_struct *work_args)
 
 	args = container_of(work_args, struct fspin_args, work);
 	meta = args->meta;
-	mm = meta->mm;
 
-	if (!mm)
+	task = find_task_by_vpid(meta->pid);
+	if (!task || task->flags & PF_EXITING)
 		goto free_out;
 
 	min_hot = MIN_PMDS_FSPIN;
@@ -400,18 +421,22 @@ static void fspin(struct work_struct *work_args)
 	nr_spins = 0;
 	sum_hot = 0;
 
-	mmget(mm);
 	do {
 		nr_hot = 0;
 		addr = meta->address;
 		end = addr + PUD_SIZE;
 
+		if (task->flags & PF_EXITING)
+			break;
+
 		if (!fspinning)
 			break;
 
-		start_ns = ktime_get_ns();
+		mm = get_task_mm(task);
+		if (!mm)
+			break;
 
-		mmap_read_lock(mm);
+		start_ns = ktime_get_ns();
 
 		pgd = pgd_offset(mm, addr);
 		if (pgd_none(*pgd) || pgd_bad(*pgd))
@@ -426,12 +451,15 @@ static void fspin(struct work_struct *work_args)
 			goto unlock;
 
 		pmd = pmd_offset(pud, addr);
-		if (pmd_none(*pmd) || pmd_bad(*pmd))
-			goto unlock;
 
 		do {
 			next = pmd_addr_end(addr, end);
-			if (!pmd_present(*pmd))
+
+			if (pmd_none(*pmd))
+				continue;
+
+			_pmd = pmdp_get_lockless(pmd);
+			if (is_swap_pmd(_pmd) || pmd_trans_huge(_pmd) || pmd_devmap(_pmd))
 				continue;
 
 			if (pmdp_test_and_clear_young(NULL, addr, pmd)) {
@@ -441,7 +469,7 @@ static void fspin(struct work_struct *work_args)
 			}
 		} while (pmd++, addr = next, addr < end);
 unlock:
-		mmap_read_unlock(mm);
+		mmput(mm);
 
 		end_ns = ktime_get_ns();
 		dur_us = (end_ns - start_ns) / 1000;
@@ -461,7 +489,6 @@ unlock:
 		ftier_delay_us(fspin_period_us - dur_us);
 		remain_spin_us -= fspin_period_us;
 	} while ((remain_spin_us > 0) && (nr_spins < MAX_SPINS));
-	mmput(mm);
 
 	meta->fspin_period_us = fspin_period_us;
 	memcpy(meta->oldspins, meta->spins, sizeof(meta->spins));
