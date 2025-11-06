@@ -121,6 +121,28 @@ TRACE_EVENT(fmigrate,
 			__entry->thresh, __entry->promote)
 );
 
+TRACE_EVENT(fhint,
+
+	TP_PROTO(int ms, unsigned int x, unsigned int y),
+
+	TP_ARGS(ms, x, y),
+
+	TP_STRUCT__entry(
+		__field(int, ms)
+		__field(unsigned int, x)
+		__field(unsigned int, y)
+	),
+
+	TP_fast_assign(
+		__entry->ms = ms;
+		__entry->x = x;
+		__entry->y = y;
+	),
+
+	TP_printk("fault_latency_ms=%d, x=%u, y=%u",
+			__entry->ms, __entry->x, __entry->y)
+);
+
 #endif /* _TRACE_FTIER_H */
 
 #include <trace/define_trace.h>

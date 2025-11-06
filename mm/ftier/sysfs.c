@@ -17,6 +17,7 @@ int sysctl_min_pmds_per_fscan = 3;
 int sysctl_max_fhot_pc = 60;
 int sysctl_migrate_batch = 512;
 int sysctl_hint_fault_latency_threshold_ms = 1000; /* 1s */
+int sysctl_pass_ratio_bp = 10000; /* 100.00% */
 int sysctl_promote_mb = 0;
 EXPORT_SYMBOL_GPL(sysctl_promote_mb);
 
@@ -372,6 +373,31 @@ static ssize_t hint_fault_latency_threshold_ms_store(struct kobject *kobj,
 static struct kobj_attribute hint_fault_latency_threshold_ms_attr =
 		__ATTR_RW(hint_fault_latency_threshold_ms);
 
+static ssize_t hf_pass_ratio_bp_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", sysctl_pass_ratio_bp);
+}
+
+static ssize_t hf_pass_ratio_bp_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	int val, err;
+
+	err = kstrtoint(buf, 10, &val);
+	if (err || val < 0 || val > 10000)
+		return -EINVAL;
+
+	mutex_lock(&ftier_sysctl_lock);
+	sysctl_pass_ratio_bp = val;
+	mutex_unlock(&ftier_sysctl_lock);
+
+	return count;
+}
+
+static struct kobj_attribute hf_pass_ratio_bp_attr =
+		__ATTR_RW(hf_pass_ratio_bp);
+
 static ssize_t promote_mb_show(struct kobject *kobj,
 		struct kobj_attribute *attr, char *buf)
 {
@@ -408,6 +434,7 @@ static struct attribute *ftier_sysfs_attrs[] = {
 	&max_fhot_pc_attr.attr,
 	&migrate_batch_attr.attr,
 	&hint_fault_latency_threshold_ms_attr.attr,
+	&hf_pass_ratio_bp_attr.attr,
 	&promote_mb_attr.attr,
 	NULL,
 };

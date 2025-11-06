@@ -81,6 +81,7 @@ extern int sysctl_min_pmds_per_fscan;
 extern int sysctl_max_fhot_pc;
 extern int sysctl_migrate_batch;
 extern int sysctl_hint_fault_latency_threshold_ms;
+extern int sysctl_pass_ratio_bp;
 extern int sysctl_promote_mb;
 extern enum ftier_tiering_mode sysctl_tiering_mode;
 

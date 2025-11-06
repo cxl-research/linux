@@ -92,6 +92,26 @@ static void ftier_delay_us(unsigned long us)
 		msleep_interruptible(us / 1000);
 }
 
+static void get_policy_nodemask(struct mempolicy *pol, nodemask_t *nodes)
+{
+	nodes_clear(*nodes);
+
+	switch (pol->mode) {
+	case MPOL_BIND:
+	case MPOL_INTERLEAVE:
+	case MPOL_PREFERRED:
+	case MPOL_PREFERRED_MANY:
+	case MPOL_WEIGHTED_INTERLEAVE:
+		*nodes = pol->nodes;
+		break;
+	case MPOL_LOCAL:
+		/* return empty node mask for local allocation */
+		break;
+	default:
+		BUG();
+	}
+}
+
 static inline void reset_spins(struct fhot_meta_gb *meta)
 {
 	memset(meta->spins, 0, sizeof(meta->spins));
@@ -109,7 +129,11 @@ static struct fhot_meta_gb * find_fhot_meta(pid_t pid, unsigned long addr)
 
 static void alloc_fhot_meta(pid_t pid, unsigned long addr)
 {
+	struct task_struct *task = find_task_by_vpid(pid);
 	struct fhot_meta_gb *meta;
+	struct mempolicy *pol;
+	nodemask_t nodemask;
+	int idx;
 
 	meta = kzalloc(sizeof(*meta), GFP_KERNEL);
 	if (!meta)
@@ -118,6 +142,15 @@ static void alloc_fhot_meta(pid_t pid, unsigned long addr)
 	meta->pid = pid;
 	meta->address = addr & PUD_MASK;
 	meta->fspin_period_us = 20000; /* 20ms */
+
+	pol = task->mempolicy;
+	if (pol && pol->mode == MPOL_BIND) {
+		get_policy_nodemask(pol, &nodemask);
+		if (node_isset(2, nodemask) || node_isset(3, nodemask)) {
+			for (idx = 0; idx < 8; ++idx)
+				meta->cxlmap[idx] = ~0UL;
+		}
+	}
 
 	INIT_LIST_HEAD(&meta->siblings);
 	list_add(&meta->siblings, &__ctx.target.fhot_list);
