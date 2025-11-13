@@ -683,11 +683,11 @@ end_iter:
 		end_ns = ktime_get_ns();
 		dur_ms = (end_ns - start_ns) / 1000000;
 
+		ticks_completed++;
 		if (dur_ms > FTIER_TICK_MS) {
 			pr_warn("ftier tick overrun (%u > %u ms)\n", dur_ms, FTIER_TICK_MS);
 			continue;
 		}
-		ticks_completed++;
 		ftier_delay_us((FTIER_TICK_MS - dur_ms) * 1000);
 	}
 

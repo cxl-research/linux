@@ -283,14 +283,20 @@ static int change_pmd_range(struct fhot_meta_gb *meta,
 	}
 
 	if (!vma_migratable(vma) || !vma_policy_mof(vma) ||
-			is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_MIXEDMAP)) {
+			is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_MIXEDMAP) ||
+			!vma->vm_mm || vma->vm_mm != mm) {
 		mmput(mm);
 		return -EINVAL;
 	}
 
-	if (!vma_is_accessible(vma) || !vma->vm_mm || vma->vm_mm != mm ||
-			(vma->vm_file && (vma->vm_flags & (VM_READ|VM_WRITE)) == (VM_READ))) {
+	if (
+			// !vma_is_accessible(vma) ||
+			(vma->vm_file && (vma->vm_flags & (VM_READ|VM_WRITE)) == (VM_READ))
+		) {
 		mmput(mm);
+		printk(KERN_INFO "ftier error2: flags=%lx, acc=%d vm_mm=%lx mm=%lx file=%lx\n", 
+				vma->vm_flags, vma_is_accessible(vma), (unsigned long)vma->vm_mm,
+				(unsigned long)mm, (unsigned long)vma->vm_file);
 		return -EINVAL;
 	}
 
@@ -412,7 +418,7 @@ static unsigned int tier_memory(struct ftier_target *t,
 			mmap_read_unlock(mm);
 			mmput(mm);
 
-			if (err < 0) {
+			if (err <= 0) {
 				failed++;
 			} else {
 				success++;
@@ -439,8 +445,8 @@ static unsigned int tier_memory(struct ftier_target *t,
 	}
 
 end:
-	trace_fmigrate(success, failed, nr_pages_success,
-			nr_pages_fail, *budget_us, dur_us, threshold, promote);
+	trace_fmigrate(success, failed, nr_pages_success, nr_pages_fail,
+			*budget_us, dur_us, threshold, promote, max_pages);
 
 	*budget_us -= dur_us;
 	return nr_pages_success;

@@ -88,9 +88,10 @@ TRACE_EVENT(fhist,
 TRACE_EVENT(fmigrate,
 
 	TP_PROTO(int succ, int fail, int succpg, int failpg, int budget_us,
-			int dur_us, unsigned int thresh, bool promote),
+			int dur_us, unsigned int thresh, bool promote, unsigned int max_pages),
 
-	TP_ARGS(succ, fail, succpg, failpg, budget_us, dur_us, thresh, promote),
+	TP_ARGS(succ, fail, succpg, failpg, budget_us,
+			dur_us, thresh, promote, max_pages),
 
 	TP_STRUCT__entry(
 		__field(int, succ)
@@ -101,6 +102,7 @@ TRACE_EVENT(fmigrate,
 		__field(int, dur_us)
 		__field(unsigned int, thresh)
 		__field(bool, promote)
+		__field(unsigned int, max_pages)
 	),
 
 	TP_fast_assign(
@@ -112,13 +114,14 @@ TRACE_EVENT(fmigrate,
 		__entry->dur_us = dur_us;
 		__entry->thresh = thresh;
 		__entry->promote = promote;
+		__entry->max_pages = max_pages;
 	),
 
-	TP_printk("succ=%d, fail=%d, succpg=%d, failpg=%d,"
-						" budget_us=%d, dur_us=%d, thresh=%u, promote=%d",
+	TP_printk("succ=%d, fail=%d, succpg=%d, failpg=%d, budget_us=%d,"
+						" dur_us=%d, thresh=%u, promote=%d, max_pages=%u",
 			__entry->succ, __entry->fail, __entry->succpg,
 			__entry->failpg, __entry->budget_us, __entry->dur_us,
-			__entry->thresh, __entry->promote)
+			__entry->thresh, __entry->promote, __entry->max_pages)
 );
 
 TRACE_EVENT(fhint,
