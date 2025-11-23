@@ -1802,6 +1802,7 @@ static void damos_adjust_quota(struct damon_ctx *c, struct damos *s)
 	struct damon_region *r;
 	unsigned long cumulated_sz;
 	unsigned int score, max_score = 0;
+	int sz_multiplier = 1, colloid_mult = 0;
 
 	if (!quota->ms && !quota->sz && list_empty(&quota->goals))
 		return;
@@ -1820,6 +1821,13 @@ static void damos_adjust_quota(struct damon_ctx *c, struct damos *s)
 	if (!c->ops.get_scheme_score)
 		return;
 
+	if (!list_empty(&quota->goals)) {
+		colloid_mult += damos_get_colloid_multiplier();
+	}
+
+	if (colloid_mult > 0)
+		sz_multiplier = colloid_mult;
+
 	/* Fill up the score histogram */
 	memset(c->regions_score_histogram, 0,
 			sizeof(*c->regions_score_histogram) *
@@ -1830,7 +1838,7 @@ static void damos_adjust_quota(struct damon_ctx *c, struct damos *s)
 				continue;
 			score = c->ops.get_scheme_score(c, t, r, s);
 			c->regions_score_histogram[score] +=
-				damon_sz_region(r);
+				damon_sz_region(r) * sz_multiplier;
 			if (score > max_score)
 				max_score = score;
 		}
