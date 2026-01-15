@@ -205,6 +205,13 @@ static inline int pmd_young(pmd_t pmd)
 }
 #endif
 
+#ifndef pud_young
+static inline int pud_young(pud_t pud)
+{
+	return 0;
+}
+#endif
+
 #ifndef pmd_dirty
 static inline int pmd_dirty(pmd_t pmd)
 {
@@ -1176,6 +1183,37 @@ static inline void arch_swap_restore(swp_entry_t entry, struct folio *folio)
 
 #ifndef flush_tlb_fix_spurious_fault
 #define flush_tlb_fix_spurious_fault(vma, address, ptep) flush_tlb_page(vma, address)
+#endif
+
+/*
+ * When walking page tables, get the address of the current boundary,
+ * or the start address of the range if that comes earlier.
+ */
+
+#define pgd_addr_start(addr, start)			\
+({	unsigned long __boundary = (addr) & PGDIR_MASK;	\
+	(__boundary > start) ? __boundary : (start);	\
+})
+
+#ifndef p4d_addr_start
+#define p4d_addr_start(addr, start)			\
+({	unsigned long __boundary = (addr) & P4D_MASK;	\
+	(__boundary > start) ? __boundary : (start);	\
+})
+#endif
+
+#ifndef pud_addr_start
+#define pud_addr_start(addr, start)			\
+({	unsigned long __boundary = (addr) & PUD_MASK;	\
+	(__boundary > start) ? __boundary : (start);	\
+})
+#endif
+
+#ifndef pmd_addr_start
+#define pmd_addr_start(addr, start)			\
+({	unsigned long __boundary = (addr) & PMD_MASK;	\
+	(__boundary > start) ? __boundary : (start);	\
+})
 #endif
 
 /*

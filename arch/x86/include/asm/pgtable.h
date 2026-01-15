@@ -197,6 +197,7 @@ static inline bool pud_dirty(pud_t pud)
 	return pud_flags(pud) & _PAGE_DIRTY_BITS;
 }
 
+#define pud_young pud_young
 static inline int pud_young(pud_t pud)
 {
 	return pud_flags(pud) & _PAGE_ACCESSED;

@@ -24,6 +24,29 @@
 #define DAMON_MIN_REGION 1
 #endif
 
+static int pick_profile_level(unsigned long start,
+		unsigned long end, unsigned long addr)
+{
+	int level = 0;
+
+	if (!arch_has_hw_nonleaf_pmd_young())
+		return level;
+
+	/* Check if PMD or higher can be picked */
+	if (pmd_addr_start(addr, (start) - 1) < start ||
+			pmd_addr_end(addr, (end) + 1) > end)
+		return level;
+	level++;
+
+	/* Check if PUD or higher can be picked */
+	if (pud_addr_start(addr, (start) - 1) < start ||
+			pud_addr_end(addr, (end) + 1) > end)
+		return level;
+	level++;
+	
+	return level;
+}
+
 /*
  * 't->pid' should be the pointer to the relevant 'struct pid' having reference
  * count.  Caller must put the returned task, unless it is NULL.
@@ -392,16 +415,50 @@ out:
 #define damon_mkold_hugetlb_entry NULL
 #endif /* CONFIG_HUGETLB_PAGE */
 
-static const struct mm_walk_ops damon_mkold_ops = {
-	.pmd_entry = damon_mkold_pmd_entry,
+static int damon_mkold_pmd(pmd_t *pmd, unsigned long addr,
+		unsigned long next, struct mm_walk *walk)
+{
+	spinlock_t *ptl;
+
+	if (!pmd_present(*pmd))
+		return 0;
+	ptl = pmd_lock(walk->mm, pmd);
+	pmdp_clear_young_notify(walk->vma, addr, pmd);
+	spin_unlock(ptl);
+
+	return 0;
+}
+
+static int damon_mkold_pud(pud_t *pud, unsigned long addr,
+	unsigned long next, struct mm_walk *walk)
+{
+	spinlock_t *ptl;
+
+	if (!pud_present(*pud))
+		return 0;
+	ptl = pud_lock(walk->mm, pud);
+	pudp_clear_young_notify(walk->vma, addr, pud);
+	spin_unlock(ptl);
+
+	return 0;
+}
+
+static const struct mm_walk_ops damon_mkold_ops[] = {
+	{.pmd_entry = damon_mkold_pmd_entry,
 	.hugetlb_entry = damon_mkold_hugetlb_entry,
-	.walk_lock = PGWALK_RDLOCK,
+	.walk_lock = PGWALK_RDLOCK},
+	{.pmd_entry = damon_mkold_pmd},
+	{.pud_entry = damon_mkold_pud},
 };
 
-static void damon_va_mkold(struct mm_struct *mm, unsigned long addr)
+static void damon_va_mkold(struct mm_struct *mm,
+		struct damon_region *r)
 {
+	unsigned long addr = r->sampling_addr;
+	int lv = pick_profile_level(r->ar.start, r->ar.end, addr);
+
 	mmap_read_lock(mm);
-	walk_page_range(mm, addr, addr + 1, &damon_mkold_ops, NULL);
+	walk_page_range(mm, addr, addr + 1, &damon_mkold_ops[lv], NULL);
 	mmap_read_unlock(mm);
 }
 
@@ -414,7 +471,7 @@ static void __damon_va_prepare_access_check(struct mm_struct *mm,
 {
 	r->sampling_addr = damon_rand(r->ar.start, r->ar.end);
 
-	damon_va_mkold(mm, r->sampling_addr);
+	damon_va_mkold(mm, r);
 }
 
 static void damon_va_prepare_access_checks(struct damon_ctx *ctx)
@@ -536,22 +593,64 @@ out:
 #define damon_young_hugetlb_entry NULL
 #endif /* CONFIG_HUGETLB_PAGE */
 
-static const struct mm_walk_ops damon_young_ops = {
-	.pmd_entry = damon_young_pmd_entry,
+static int damon_young_pmd(pmd_t *pmd, unsigned long addr,
+		unsigned long next, struct mm_walk *walk)
+{
+	spinlock_t *ptl;
+	struct damon_young_walk_private *priv = walk->private;
+
+	if (!pmd_present(*pmd))
+		return 0;
+
+	ptl = pmd_lock(walk->mm, pmd);
+	if (pmd_young(*pmd) || mmu_notifier_test_young(walk->mm, addr))
+		priv->young = true;
+
+	*priv->folio_sz = (1UL << PMD_SHIFT);
+	spin_unlock(ptl);
+	
+	return 0;
+}
+
+static int damon_young_pud(pud_t *pud, unsigned long addr,
+		unsigned long next, struct mm_walk *walk)
+{
+	spinlock_t *ptl;
+	struct damon_young_walk_private *priv = walk->private;
+
+	if (!pud_present(*pud))
+		return 0;
+
+	ptl = pud_lock(walk->mm, pud);
+	if (pud_young(*pud) || mmu_notifier_test_young(walk->mm, addr))
+		priv->young = true;
+
+	*priv->folio_sz = (1UL << PUD_SHIFT);
+	spin_unlock(ptl);
+
+	return 0;
+}
+
+static const struct mm_walk_ops damon_young_ops[] = {
+	{.pmd_entry = damon_young_pmd_entry,
 	.hugetlb_entry = damon_young_hugetlb_entry,
-	.walk_lock = PGWALK_RDLOCK,
+	.walk_lock = PGWALK_RDLOCK},
+	{.pmd_entry = damon_young_pmd, .walk_lock = PGWALK_RDLOCK},
+	{.pud_entry = damon_young_pud, .walk_lock = PGWALK_RDLOCK},
 };
 
-static bool damon_va_young(struct mm_struct *mm, unsigned long addr,
+static bool damon_va_young(struct mm_struct *mm, struct damon_region *r,
 		unsigned long *folio_sz)
 {
+	unsigned long addr = r->sampling_addr;
+	int lv = pick_profile_level(r->ar.start, r->ar.end, addr);
 	struct damon_young_walk_private arg = {
 		.folio_sz = folio_sz,
 		.young = false,
 	};
 
 	mmap_read_lock(mm);
-	walk_page_range(mm, addr, addr + 1, &damon_young_ops, &arg);
+	walk_page_range(mm, addr, addr + 1, &damon_young_ops[lv], &arg);
 	mmap_read_unlock(mm);
 	return arg.young;
 }
@@ -582,7 +681,7 @@ static void __damon_va_check_access(struct mm_struct *mm,
 		return;
 	}
 
-	last_accessed = damon_va_young(mm, r->sampling_addr, &last_folio_sz);
+	last_accessed = damon_va_young(mm, r, &last_folio_sz);
 	damon_update_region_access_rate(r, last_accessed, attrs);
 
 	last_addr = r->sampling_addr;
