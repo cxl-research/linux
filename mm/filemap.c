@@ -1383,6 +1383,7 @@ void migration_entry_wait_on_locked(swp_entry_t entry, spinlock_t *ptl)
 	bool in_thrashing;
 	wait_queue_head_t *q;
 	struct folio *folio = pfn_swap_entry_folio(entry);
+	void (*account_waittime)(u64);
 	u64 start_time, end_time;
 
 	start_time = ktime_get_ns();
@@ -1436,7 +1437,9 @@ void migration_entry_wait_on_locked(swp_entry_t entry, spinlock_t *ptl)
 		psi_memstall_leave(&pflags);
 	}
 	end_time = ktime_get_ns();
-	colloid_account_waittime((end_time - start_time));
+	account_waittime = READ_ONCE(colloid_account_waittime);
+	if (account_waittime)
+		account_waittime(end_time - start_time);
 }
 #endif
 

@@ -3561,9 +3561,9 @@ retry_pids:
 	}
 
 out:
-	printk(KERN_INFO "task_numa_work: (%d):%lx %lx:%ld %ld\n",
+	printk(KERN_INFO "task_numa_work:(%d %d): %lx %lx: pages=%ld virt=%ld\n",
 	       p->pid, p->tgid, mm->numa_scan_offset, start,
-	       (long)(pages), (long)(virtpages));
+	       pages, virtpages);
 
 	/*
 	 * It is possible to reach the end of the VMA list but the last few
