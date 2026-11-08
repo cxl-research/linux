@@ -1,30 +1,30 @@
-// SPDX-License-Identifier: GPL-2.0
-
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
- * FTier API
+ * FTier: memory tiering for bandwidth expansion.
  *
- * Copyright (c) 2025 Alan Nair
+ * Interfaces exported to the rest of the kernel (fault path, memory
+ * tiers) and to tier-latency monitor modules.
+ *
+ * Copyright (c) 2025-2026 Alan Nair <alannair1000@gmail.com>
  */
+#ifndef _LINUX_FTIER_H
+#define _LINUX_FTIER_H
 
-#include <linux/delay.h>
-#include <linux/fs.h>
-#include <linux/migrate.h>
-#include <linux/mm.h>
-#include <linux/mmu_notifier.h>
 #include <linux/types.h>
 
-/* Machine specific */
+struct folio;
+struct mm_struct;
+
+/* Machine specific: DRAM node 1, CXL nodes 2 and 3 on the test server. */
 #define CXL_NID(nid) ((nid) > 1)
 #define DRAM_NID(nid) ((nid) == 1)
 #define NR_NODES 4
 
-#define pudp_clear_young_notify(__mm, __addr, __pudp)										\
-({																																			\
-	int __young;																													\
-	__young = pudp_test_and_clear_young(NULL, __addr, __pudp);						\
-	__young |= mmu_notifier_clear_young(__mm, __addr, __addr + PUD_SIZE);	\
-	__young;																															\
-})
+/*
+ * Kept for out-of-tree latency monitors that scale sysctl_promote_mb by
+ * FTIER_TICK_MS / POLL_MS: sysctl_promote_mb is a rate in MB per second.
+ */
+#define FTIER_TICK_MS 1000
 
 enum ftier_status {
 	FTIER_STATUS_OFF,
@@ -34,7 +34,8 @@ enum ftier_status {
 };
 
 enum ftier_target_type {
-	FTIER_TARGET_PID, /* default */
+	FTIER_TARGET_NONE,
+	FTIER_TARGET_PID,
 	FTIER_TARGET_CGROUP,
 	NR_FTIER_TARGET_TYPES,
 };
@@ -45,53 +46,21 @@ enum ftier_tiering_mode {
 	NR_FTIER_TIERING_MODES,
 };
 
-struct fhot_meta_gb {
-	pid_t pid;
-	unsigned long address;
-	unsigned int fspin_period_us;
-	unsigned int nr_mapped;
-	struct list_head siblings;
-	unsigned char spins[512];
-	unsigned char oldspins[512];
-	unsigned long cxlmap[8];
-};
-
-#define MAX_SPINS 255 /* max(unsigned char) */
-#define FTIER_TICK_MS 1000
-#define TICK_BUDGET_MS ((FTIER_TICK_MS) * 9 / 10) /* 90% of tick */
-#define MIN_TIER_BUDGET_MS 100
-
-struct ftier_target {
-	pid_t pid;
-	struct cgroup *cg;
-	enum ftier_target_type type;
-	struct list_head fhot_list;
-	unsigned int nr_fhot;
-	struct workqueue_struct *wq;
-};
-
-struct ftier_ctx {
-	struct task_struct *task;
-	struct ftier_target target;
-};
-
-extern int sysctl_fscan_period_ms;
-extern int sysctl_fspin_ms;
-extern int sysctl_min_pmds_per_fscan;
-extern int sysctl_max_fhot_pc;
-extern int sysctl_migrate_batch;
-extern int sysctl_hint_fault_latency_threshold_ms;
-extern int sysctl_pass_ratio_bp;
+/*
+ * Target migration rate in MB/s requested by the tier latency monitor:
+ * > 0 promotes (CXL -> DRAM), < 0 demotes (DRAM -> CXL), 0 idles.
+ */
 extern int sysctl_promote_mb;
 extern enum ftier_tiering_mode sysctl_tiering_mode;
+extern int sysctl_pass_ratio_bp;
 
-int ftier_temptrack_start(void);
-int ftier_temptrack_stop(void);
-void ftier_tiering_start(void);
-void ftier_tiering_stop(void);
-void ftier_tier_memory(struct ftier_target *t,
-		int promote_mb, int budget_us, bool hist_update);
+#ifdef CONFIG_FTIER
+bool ftier_mm_is_target(struct mm_struct *mm);
+#else
+static inline bool ftier_mm_is_target(struct mm_struct *mm)
+{
+	return false;
+}
+#endif
 
-struct ftier_target *get_target(void);
-int set_target_pid(pid_t pid);
-int set_target_cgroup(const char *path);
+#endif /* _LINUX_FTIER_H */
