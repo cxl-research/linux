@@ -278,7 +278,12 @@ t_cha() {
 		return
 	fi
 	echo 1 > $T/events/ftier/ftier_tier/enable
+	# The CHAs only see requests from cores of the monitored socket.
+	n=$(sed 's/[-,].*//' $F/dram_nodes)
+	hot=$HOT
+	HOT="taskset -c $(cat /sys/devices/system/node/node$n/cpulist) $hot"
 	start_hot_pg /tmp/cha.log -s $SIZE -H $SIZE -t 10 -b $SLOW
+	HOT=$hot
 	cha_load poll_ms=100 || { fail cha_load; kill $HPID; return; }
 	sleep 3
 	n=$(grep -c ' ftier_tier:' $T/trace)
