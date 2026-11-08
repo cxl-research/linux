@@ -63,19 +63,24 @@ static const struct bus_type memory_tier_subsys = {
  *
  * Return: the folio _last_cpupid is used to record page access time
  */
-#ifdef CONFIG_FTIER_TIER_MEM
 bool folio_use_access_time(struct folio *folio)
 {
-	int nid = folio_nid(folio);
-	return (DRAM_NID(nid) || CXL_NID(nid));
-}
-#else
-bool folio_use_access_time(struct folio *folio)
-{
+#ifdef CONFIG_FTIER
+	/*
+	 * FTier hint-fault mode needs the access time on both tiers; keep
+	 * _last_cpupid semantics untouched otherwise so that regular NUMA
+	 * balancing is unaffected by FTier being built in.
+	 */
+	if (READ_ONCE(sysctl_tiering_mode) == HINT_FAULT) {
+		int nid = folio_nid(folio);
+
+		if (DRAM_NID(nid) || CXL_NID(nid))
+			return true;
+	}
+#endif
 	return (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) &&
 	       !node_is_toptier(folio_nid(folio));
 }
-#endif
 #endif
 
 #ifdef CONFIG_MIGRATION

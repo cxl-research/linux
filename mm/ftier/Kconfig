@@ -3,29 +3,20 @@
 menu "FTier Memory Tiering Support"
 
 config FTIER
-	bool "FTier Memory Tiering Support"
+	bool "FTier memory tiering for bandwidth expansion"
+	depends on X86_64 && NUMA && MMU
+	depends on NUMA_BALANCING && MIGRATION && TRANSPARENT_HUGEPAGE
+	depends on CGROUPS
 	help
-		Enables memory tiering between DRAM and CXL memory.
+	  FTier tiers application memory between DRAM and CXL-attached
+	  memory to expand usable memory bandwidth. Hotness is tracked with
+	  Adaptive Frequency Scanning of the accessed bits of upper-level
+	  page table entries, and hot pages are migrated in the direction
+	  requested by a tier latency monitor.
 
-choice
-	prompt "FTIER Mode of Operation"
-	depends on FTIER
-	default FTIER_TRACK_TEMP
-	help
-		Choose the mode of operation for FTier memory tiering.
-		Default is to track temperature only.
+	  FTier is controlled at runtime through /sys/kernel/mm/ftier and is
+	  inactive until enabled there.
 
-config FTIER_TRACK_TEMP
-	bool "Track Temperature Only"
-	help
-		FTier will use metadata from upper-level Page Table Entries
-		to track memory temperature.
-
-config FTIER_TIER_MEM
-	bool "Tier Memory"
-	help
-		FTier will promote hot pages to lower-latency tier.
-
-endchoice
+	  If unsure, say N.
 
 endmenu

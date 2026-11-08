@@ -271,6 +271,8 @@ int set_target_pid(pid_t pid)
 struct ftier_walk_private {
 	unsigned long count;
 	pid_t pid;
+	/* A PUD spanning several VMAs is visited once per VMA. */
+	unsigned long last_addr;
 };
 
 static int fscan(pud_t *pud, unsigned long addr,
@@ -279,9 +281,8 @@ static int fscan(pud_t *pud, unsigned long addr,
 	struct ftier_walk_private *priv = walk->private;
 	pid_t pid = priv->pid;
 	struct fhot_meta_gb *meta;
-	static unsigned long last_addr = 0;
 
-	if (last_addr == (addr & PUD_MASK))
+	if (priv->last_addr == (addr & PUD_MASK))
 		goto endscan;
 
 	if (pud_young(*pud)) {
@@ -298,7 +299,7 @@ static int fscan(pud_t *pud, unsigned long addr,
 			destroy_fhot_meta(meta, false);
 	}
 
-	last_addr = addr & PUD_MASK;
+	priv->last_addr = addr & PUD_MASK;
 endscan:
 	walk->action = ACTION_CONTINUE;
 	return 0;
@@ -312,7 +313,9 @@ static const struct mm_walk_ops ftier_walk_ops = {
 static void fscan_page_tables_mm(struct mm_struct *mm, pid_t pid)
 {
 	unsigned long start = 0, end = 0x7fffffffffffUL;
-	struct ftier_walk_private priv = { .count = 0, .pid = pid };
+	struct ftier_walk_private priv = {
+		.count = 0, .pid = pid, .last_addr = -1UL,
+	};
 	uint64_t start_ns, end_ns;
 
 	start_ns = ktime_get_ns();

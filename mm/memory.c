@@ -5737,6 +5737,7 @@ static vm_fault_t do_fault(struct vm_fault *vmf)
 	return ret;
 }
 
+#ifdef CONFIG_FTIER
 /* Stores histogram of FTier fault latencies
  *  ___________________________________________________
  * |0|1|2|...|999|1000|1001|...|1017|1018|...|1022|1023|
@@ -5783,25 +5784,28 @@ static void update_fault_latency_histogram(int latency, bool cxl)
 		FLT_LAT_HIST_CXL[index]++;
 }
 
+/* Called with the PTE lock held: must not sleep. */
+static DEFINE_SPINLOCK(flt_hist_lock);
+
 static void check_age_fault_latency_histogram(void)
 {
 	int i, now, diff, threshold = 0;
 	long cumsum = 0, newcumsum = 0;
-	DEFINE_MUTEX(hist_mutex);
 
 	now = jiffies_to_msecs(jiffies);
 	diff = now - last_histogram_aged_timestamp;
 	if (diff < 1000)
 		return;
 
-	mutex_lock(&hist_mutex);
+	if (!spin_trylock(&flt_hist_lock))
+		return;
 	trace_fhint(-1, dram_flt_lat_thresh_ms, cxl_flt_lat_thresh_ms);
 	for (i = 0; i < FLT_LAT_HIST_LEN; i++) {
 		trace_fhint(i, FLT_LAT_HIST_DRAM[i], FLT_LAT_HIST_CXL[i]);
 	}
 
-	while (diff < 1000) {
-		diff -= 1000;
+	/* After 32 halvings every u32 bucket is zero anyway. */
+	for (diff = min(diff / 1000, 32); diff > 0; diff--) {
 		for (i = 0; i < FLT_LAT_HIST_LEN; i++) {
 			FLT_LAT_HIST_DRAM[i] >>= 1;
 			FLT_LAT_HIST_CXL[i] >>= 1;
@@ -5842,7 +5846,7 @@ static void check_age_fault_latency_histogram(void)
 		cxl_flt_lat_thresh_ms = 60000; /* Maximum */
 
 	last_histogram_aged_timestamp = jiffies_to_msecs(jiffies);
-	mutex_unlock(&hist_mutex);
+	spin_unlock(&flt_hist_lock);
 }
 
 static int ftier_hint_fault_latency(struct folio *folio)
@@ -5864,7 +5868,8 @@ static int ftier_migrate_check(struct folio *folio)
 
 	src_nid = folio_nid(folio);
 	promote = (sysctl_promote_mb > 0);
-	if ((promote && DRAM_NID(src_nid)) && (!promote && CXL_NID(src_nid)))
+	/* Only migrate folios that sit on the source tier of this direction. */
+	if ((promote && !CXL_NID(src_nid)) || (!promote && !DRAM_NID(src_nid)))
 		return NUMA_NO_NODE;
 
 	latency = ftier_hint_fault_latency(folio);
@@ -5889,6 +5894,7 @@ static int ftier_migrate_check(struct folio *folio)
 
 	return target_nid;
 }
+#endif /* CONFIG_FTIER */
 
 int numa_migrate_check(struct folio *folio, struct vm_fault *vmf,
 		      unsigned long addr, int *flags,
@@ -5934,9 +5940,10 @@ int numa_migrate_check(struct folio *folio, struct vm_fault *vmf,
 		*flags |= TNF_FAULT_LOCAL;
 	}
 
-	/* FTier Check */
+#ifdef CONFIG_FTIER
 	if (sysctl_tiering_mode == HINT_FAULT)
 		return ftier_migrate_check(folio);
+#endif
 
 	return mpol_misplaced(folio, vmf, addr);
 }
@@ -6230,8 +6237,7 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
 	if (!pte_present(vmf->orig_pte))
 		return do_swap_page(vmf);
 
-	// if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
-	if (pte_protnone(vmf->orig_pte))
+	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
 		return do_numa_page(vmf);
 
 	spin_lock(vmf->ptl);
