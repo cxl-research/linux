@@ -42,6 +42,7 @@ documentation, or deleted if it has served its purpose.
    balance
    damon/index
    free_page_reporting
+   ftier
    hmm
    hwpoison
    hugetlbfs_reserv

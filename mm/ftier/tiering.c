@@ -5,8 +5,9 @@
  * Every tick, the target migration rate set by the tier latency monitor
  * (sysctl_promote_mb, MB/s, capped by max_migrate_mbps) is converted to
  * a page budget. Candidates are PMD entries taken from the Hotlist,
- * hottest first. Depending on the tiering mode, the pages of a candidate
- * that sit on the source tier are either migrated right away
+ * starting at a hotness level adapted to the response of the tier
+ * latencies (adapt_level()). Depending on the tiering mode, the pages of
+ * a candidate that sit on the source tier are either migrated right away
  * (demand_migrate) or protected so that their next access raises a hint
  * fault, which migrates them if the hint-fault latency is low enough
  * (hint_fault).
@@ -788,3 +789,7 @@ out:
 		       div_u64(elapsed, NSEC_PER_USEC), first, r.promote,
 		       r.max_pages);
 }
+
+#ifdef CONFIG_FTIER_KUNIT_TEST
+#include "tests/ftier_kunit.c"
+#endif
