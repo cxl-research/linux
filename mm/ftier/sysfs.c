@@ -77,6 +77,7 @@ static ssize_t ftier_status_store(struct kobject *kobj,
 		struct kobj_attribute *attr, const char *buf, size_t count)
 {
 	enum ftier_status new_status, old_status;
+	int err;
 
 	for (new_status = 0; new_status < NR_FTIER_STATUSES; new_status++) {
 		if (sysfs_streq(buf, ftier_status_strs[new_status]))
@@ -86,16 +87,17 @@ static ssize_t ftier_status_store(struct kobject *kobj,
 	if (new_status == NR_FTIER_STATUSES)
 		return -EINVAL;
 
-	old_status = sysctl_ftier_status;
-	if (new_status == old_status)
-		return count;
-
 	mutex_lock(&ftier_sysctl_lock);
-	if (update_ftier_status(old_status, new_status) == 0)
-		sysctl_ftier_status = new_status;
+	old_status = sysctl_ftier_status;
+	err = 0;
+	if (new_status != old_status) {
+		err = update_ftier_status(old_status, new_status);
+		if (!err)
+			sysctl_ftier_status = new_status;
+	}
 	mutex_unlock(&ftier_sysctl_lock);
 
-	return count;
+	return err ? err : count;
 }
 
 static struct kobj_attribute ftier_status_attr =
@@ -202,6 +204,10 @@ static ssize_t target_cgroup_store(struct kobject *kobj,
 	len = count;
 	if (count && (buf[count - 1] == '\n'))
 		len--;
+	if (len <= 0)
+		return -EINVAL;
+	if (len >= sizeof(path))
+		return -ENAMETOOLONG;
 
 	memcpy(path, buf, len);
 	path[len] = '\0';
@@ -439,11 +445,6 @@ static struct attribute *ftier_sysfs_attrs[] = {
 	NULL,
 };
 ATTRIBUTE_GROUPS(ftier_sysfs);
-
-static const struct kobj_type ftier_sysfs_ktype = {
-	.sysfs_ops = &kobj_sysfs_ops,
-	.default_groups = ftier_sysfs_groups,
-};
 
 static int __init ftier_sysfs_init(void)
 {

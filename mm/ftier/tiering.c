@@ -74,8 +74,9 @@ static int thresh(unsigned int *histogram, unsigned int promote_pmds)
 	if (!histogram || !promote_pmds)
 		return 0; /* disable promotion */
 
+	/* Never select PMDs that were not observed accessed at all. */
 	sum = 0;
-	for (idx = MAX_SPINS; idx > 0; --idx) {
+	for (idx = MAX_SPINS; idx > 1; --idx) {
 		sum += histogram[idx];
 		if (sum >= promote_pmds)
 			break;
@@ -452,7 +453,7 @@ end:
 	return nr_pages_success;
 }
 
-unsigned int *histogram = NULL;
+static unsigned int *histogram;
 
 void ftier_tier_memory(struct ftier_target *t,
 		int promote_mb, int budget_us, bool hist_update)
@@ -481,8 +482,8 @@ void ftier_tier_memory(struct ftier_target *t,
 	if (!histogram)
 		return;
 
-	pmds_to_tier = mb / 2;
-	maxpages = mb * 256;
+	pmds_to_tier = DIV_ROUND_UP(mb, PMD_SIZE >> 20);
+	maxpages = mb << (20 - PAGE_SHIFT);
 	do {
 		threshold = thresh(histogram, pmds_to_tier);
 		tiered_pages = tier_memory(t, threshold, promote,
