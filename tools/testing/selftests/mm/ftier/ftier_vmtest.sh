@@ -414,6 +414,21 @@ t_churn() {	# $1 = iterations
 	pass churn "iterations=$iters"
 }
 
+# Results of the FTier KUnit suite, when built in (CONFIG_FTIER_KUNIT_TEST).
+t_kunit() {
+	r=/sys/kernel/debug/kunit/ftier/results
+	if [ ! -r $r ]; then
+		r=/tmp/kunit.log
+		dmesg | sed 's/^\[[ 0-9.]*\] //' | sed -n '/# Subtest: ftier$/,/ok [0-9]* ftier$/p' > $r
+		[ -s $r ] || return 0
+	fi
+	cat $r
+	nok=$(grep -c '^ *not ok' $r)
+	ok=$(grep -c '^ *ok ' $r)
+	check kunit "$([ "$nok" -eq 0 ] && [ "$ok" -gt 0 ] && echo 1 || echo 0)" \
+		"ok=$ok not_ok=$nok"
+}
+
 t_dmesg() {
 	if dmesg | grep -E 'BUG:|WARNING:|possible circular|inconsistent lock|INFO: task|INFO: rcu|sleeping function|list_(add|del) corruption|Oops|general protection|stack-protector|refcount_t:|ODEBUG|kmemleak:.*new suspected|soft lockup|hard LOCKUP' > /tmp/dmesg.bad; then
 		fail dmesg_clean "$(head -c 2000 /tmp/dmesg.bad)"
@@ -423,7 +438,7 @@ t_dmesg() {
 	fi
 }
 
-TESTS=${TESTS:-"sysfs invalid tracking promote_demand promote_hint promote_hint_fixed promote_hint_hist promote_hint_fewcand promote_demand_fewcand demote nodes level monitor cgroup exit trace cha churn dmesg"}
+TESTS=${TESTS:-"sysfs invalid tracking promote_demand promote_hint promote_hint_fixed promote_hint_hist promote_hint_fewcand promote_demand_fewcand demote nodes level monitor cgroup exit trace cha churn kunit dmesg"}
 for t in $TESTS; do
 	echo "=== $t"
 	case $t in

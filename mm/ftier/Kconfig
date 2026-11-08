@@ -15,7 +15,8 @@ config FTIER
 	  requested by a tier latency monitor.
 
 	  FTier is controlled at runtime through /sys/kernel/mm/ftier and is
-	  inactive until enabled there.
+	  inactive until enabled there. See
+	  Documentation/admin-guide/mm/ftier.rst.
 
 	  If unsure, say N.
 
@@ -32,5 +33,16 @@ config FTIER_CHA_MONITOR
 	  The module is called ftier_cha. It programs the CHA counters
 	  directly, so perf uncore_cha events must not be used while it is
 	  loaded.
+
+config FTIER_KUNIT_TEST
+	bool "KUnit tests for FTier" if !KUNIT_ALL_TESTS
+	depends on FTIER && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Unit tests of the FTier Hotlist, candidate selection, hint-fault
+	  threshold, hotness level adaptation and tier signal. They run at
+	  boot and leave FTier as they found it.
+
+	  If unsure, say N.
 
 endmenu
