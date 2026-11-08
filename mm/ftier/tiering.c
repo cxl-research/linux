@@ -34,9 +34,6 @@
 
 #include <trace/events/ftier.h>
 
-/* Residency flags stay valid for this many Hotlist epochs. */
-#define FTIER_RESIDENCY_TTL	1
-
 struct tier_round {
 	bool promote;
 	nodemask_t src;
@@ -80,6 +77,8 @@ static bool dst_node(const struct tier_round *r, int nid)
 
 /* ---------------------------------------------------------------------
  * Residency hints: skip regions recently found to have nothing to move.
+ * FTier's own migrations keep them up to date, so they only go stale when
+ * pages move or are allocated outside FTier; residency_epochs bounds that.
  */
 
 static u8 hot_stamp(const struct ftier_hotlist *hl)
@@ -94,7 +93,7 @@ static bool residency_valid(const struct ftier_hotlist *hl,
 {
 	u8 stamp = hot->flags >> FTIER_HOT_STAMP_SHIFT;
 
-	return ((hot_stamp(hl) - stamp) & 0x1f) <= FTIER_RESIDENCY_TTL;
+	return ((hot_stamp(hl) - stamp) & 0x1f) <= FTIER_CFG(residency_epochs);
 }
 
 static bool region_has_no_src(const struct ftier_hotlist *hl,
@@ -666,7 +665,12 @@ void ftier_tier_reset(void)
 	ftier_hint_reset();
 }
 
-/* Handle candidates until @max_pages or the time budget is reached. */
+/*
+ * Handle candidates until @max_pages, max_candidates regions with pages
+ * to move, or the time budget is reached. Regions with nothing to move
+ * do not count: after a cooling period, AFS relinks entries in address
+ * order, so the bucket heads may hold many regions already moved.
+ */
 static unsigned int tier_candidates(struct tier_round *r, unsigned int n,
 				    u64 t0, u64 budget_ns)
 {
@@ -674,7 +678,8 @@ static unsigned int tier_candidates(struct tier_round *r, unsigned int n,
 	unsigned int i, nr_hot = 0;
 	long ret;
 
-	for (i = 0; i < n && r->nr_pages < r->max_pages; i++) {
+	for (i = 0; i < n && r->nr_pages < r->max_pages &&
+		    nr_hot < FTIER_CFG(max_candidates); i++) {
 		ret = tier_region(r, cands[i]);
 		r->nr_regions++;
 		if (ret > 0) {
@@ -730,8 +735,8 @@ void ftier_tier_tick(unsigned int tick_ms, u64 budget_ns)
 				     migrate_credit + credit_max * tick_ms /
 						      MSEC_PER_SEC);
 		r.max_pages = migrate_credit;
-		n = collect_candidates(hl, r.promote,
-				       FTIER_CFG(max_candidates), &first);
+		n = collect_candidates(hl, r.promote, FTIER_MAX_CANDIDATES,
+				       &first);
 		tier_candidates(&r, n, t0, budget_ns);
 		migrate_credit -= min(migrate_credit, r.nr_pages);
 		ftier_ctx.level_pages += r.nr_pages;
@@ -759,10 +764,9 @@ void ftier_tier_tick(unsigned int tick_ms, u64 budget_ns)
 		goto out;
 
 	r.max_pages = ftier_ctx.ival_target - ftier_ctx.ival_done;
-	n = collect_candidates(hl, r.promote, FTIER_CFG(max_candidates),
-			       &first);
+	n = collect_candidates(hl, r.promote, FTIER_MAX_CANDIDATES, &first);
 	nr_hot = tier_candidates(&r, n, t0, budget_ns);
-	if (!r.nr_regions)
+	if (!r.nr_pages)
 		goto out;
 	thresh = round_threshold_ms(cand_hot, nr_hot);
 	if (FTIER_CFG(hint_mode) != FTIER_HINT_HISTOGRAM)

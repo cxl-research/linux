@@ -58,6 +58,7 @@ struct ftier_config ftier_cfg = {
 	.migrate_batch		= 512,
 	.max_migrate_mbps	= 1024,
 	.max_candidates		= 256,
+	.residency_epochs	= 8,
 	.hint_mode		= FTIER_HINT_MEDIAN,
 	.hint_min_ms		= 1,
 	.hint_max_ms		= 1000,
