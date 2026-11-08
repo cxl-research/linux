@@ -320,6 +320,7 @@ FTIER_CFG_ATTR(min_pmds_per_fscan, low_wm, 0, FTIER_NR_PMD, true);
 FTIER_CFG_ATTR(max_fhot_pc, high_wm_pct, 1, 100, true);
 FTIER_BOOL_ATTR(track_thp, track_thp);
 FTIER_BOOL_ATTR(notify_secondary, notify_secondary);
+FTIER_CFG_ATTR(flush_tlb, flush_tlb, 0, FTIER_FLUSH_MAX, true);
 
 /* Scanning is continuous since the AFS rework: kept for compatibility. */
 static int sysctl_fspin_ms = 5000;
@@ -329,7 +330,7 @@ static ssize_t stats_show(struct kobject *kobj,
 			  struct kobj_attribute *attr, char *buf)
 {
 	struct ftier_stats st;
-	u64 nr_scans = 0, busy_ns = 0;
+	u64 nr_scans = 0, busy_ns = 0, nr_flush = 0;
 	unsigned long nr_spaces, nr_puds = 0, nr_hot;
 	struct ftier_space *sp;
 	unsigned int i;
@@ -344,6 +345,7 @@ static ssize_t stats_show(struct kobject *kobj,
 	for (i = 0; i < ftier_ctx.nr_scanners; i++) {
 		nr_scans += READ_ONCE(ftier_ctx.scanners[i].nr_scans);
 		busy_ns += READ_ONCE(ftier_ctx.scanners[i].busy_ns);
+		nr_flush += READ_ONCE(ftier_ctx.scanners[i].nr_tlb_flush);
 	}
 	mutex_unlock(&ftier_lock);
 
@@ -356,6 +358,7 @@ static ssize_t stats_show(struct kobject *kobj,
 	S("fscan_us", div_u64(st.fscan_ns, NSEC_PER_USEC));
 	S("nr_pmd_scans", nr_scans);
 	S("pmd_scan_us", div_u64(busy_ns, NSEC_PER_USEC));
+	S("nr_tlb_flush", nr_flush);
 	S("nr_intervals", st.nr_intervals);
 	S("collect_us", div_u64(st.collect_ns, NSEC_PER_USEC));
 	S("nr_throttled", st.nr_throttled);
@@ -425,6 +428,7 @@ static struct attribute *ftier_sysfs_attrs[] = {
 	&nr_scanners_attr.attr,
 	&track_thp_attr.attr,
 	&notify_secondary_attr.attr,
+	&flush_tlb_attr.attr,
 	&migrate_batch_attr.attr,
 	&max_migrate_mbps_attr.attr,
 	&stats_attr.attr,

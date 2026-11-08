@@ -45,8 +45,23 @@ struct ftier_config {
 	unsigned int nr_scanners;	/* AFS scanner threads */
 	bool track_thp;			/* count PMD-mapped THPs */
 	bool notify_secondary;		/* query secondary MMUs (KVM) */
+	unsigned int flush_tlb;		/* enum ftier_flush_tlb */
 	unsigned int migrate_batch;
 	unsigned int max_migrate_mbps;	/* global migration-rate cap */
+};
+
+/*
+ * x86 clears accessed bits without a TLB flush, and the CPU sets them
+ * again only on a page walk. A THP mapped by a cached TLB entry thus
+ * looks idle however hot it is, and cached paging-structure entries hide
+ * repeat accesses through non-leaf PMDs too. Flushing after a scan trades
+ * IPIs for accuracy.
+ */
+enum ftier_flush_tlb {
+	FTIER_FLUSH_NEVER,		/* as in the FTier design */
+	FTIER_FLUSH_LEAF,		/* after clearing young PMD leaves */
+	FTIER_FLUSH_ALL,		/* after clearing any young PMD entry */
+	FTIER_FLUSH_MAX = FTIER_FLUSH_ALL,
 };
 
 extern struct ftier_config ftier_cfg;
@@ -130,6 +145,7 @@ struct ftier_scanner {
 	/* statistics */
 	u64 nr_scans;
 	u64 busy_ns;
+	u64 nr_tlb_flush;
 };
 
 struct ftier_stats {

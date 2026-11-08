@@ -53,6 +53,7 @@ struct ftier_config ftier_cfg = {
 	.nr_scanners		= 4,
 	.track_thp		= true,
 	.notify_secondary	= true,
+	.flush_tlb		= FTIER_FLUSH_NEVER,
 	.migrate_batch		= 512,
 	.max_migrate_mbps	= 1024,
 };

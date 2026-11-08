@@ -30,6 +30,7 @@
 #include <linux/pagewalk.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
+#include <asm/tlbflush.h>
 
 #include "internal.h"
 
@@ -41,6 +42,8 @@ struct afs_walk {
 	unsigned int last_idx;
 	unsigned int nr_mapped;
 	unsigned int nr_young;
+	unsigned int flush_tlb;
+	unsigned long flush_start, flush_end;	/* young entries to flush */
 	bool track_thp;
 	bool notify;
 };
@@ -75,6 +78,11 @@ static int afs_pmd_entry(pmd_t *pmd, unsigned long addr,
 		w->nr_young++;
 		if (w->counts[idx] < U16_MAX)
 			w->counts[idx]++;
+		if (w->flush_tlb == FTIER_FLUSH_ALL ||
+		    (w->flush_tlb == FTIER_FLUSH_LEAF && pmd_trans_huge(val))) {
+			w->flush_start = min(w->flush_start, start);
+			w->flush_end = start + PMD_SIZE;
+		}
 	}
 	return 0;
 }
@@ -111,6 +119,8 @@ static void afs_scan(struct ftier_pud *pud)
 		.pud = pud,
 		.counts = pud->counts[READ_ONCE(pud->cur)],
 		.last_idx = UINT_MAX,
+		.flush_tlb = FTIER_CFG(flush_tlb),
+		.flush_start = ULONG_MAX,
 		.track_thp = FTIER_CFG(track_thp),
 	};
 	u64 now = ktime_get_ns(), t0, t1;
@@ -141,6 +151,11 @@ static void afs_scan(struct ftier_pud *pud)
 	t0 = ktime_get_ns();
 	walk_page_range(mm, pud->addr, pud->addr + PUD_SIZE,
 			&afs_walk_ops, &w);
+	if (w.flush_end) {
+		flush_tlb_mm_range(mm, w.flush_start, w.flush_end, PMD_SHIFT,
+				   false);
+		pud->scanner->nr_tlb_flush++;
+	}
 	t1 = ktime_get_ns();
 	mmap_read_unlock(mm);
 	mmput(mm);
