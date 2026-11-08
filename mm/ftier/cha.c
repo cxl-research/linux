@@ -111,7 +111,6 @@ static const struct x86_cpu_id cha_cpu_ids[] = {
 	X86_MATCH_VFM(INTEL_EMERALDRAPIDS_X, NULL),
 	{}
 };
-MODULE_DEVICE_TABLE(x86cpu, cha_cpu_ids);
 
 struct cha_ctr {
 	u64 prev, curr;
