@@ -431,8 +431,9 @@ for t in $TESTS; do
 	promote_hint) t_promote hint_fault ;;
 	promote_hint_fixed) t_promote hint_fault fixed ;;
 	promote_hint_hist) t_promote hint_fault histogram ;;
-	promote_hint_fewcand) t_promote hint_fault fixed 8 ;;
-	promote_demand_fewcand) t_promote demand_migrate "" 8 ;;
+	# One eighth of the hot regions per round: 1 s rounds move all of it.
+	promote_hint_fewcand) t_promote hint_fault fixed $((HOTMB / 16)) ;;
+	promote_demand_fewcand) t_promote demand_migrate "" $((HOTMB / 16)) ;;
 	churn) t_churn ${CHURN:-300} ;;
 	*) t_$t ;;
 	esac
