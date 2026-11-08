@@ -23,6 +23,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/pagewalk.h>
 #include <linux/sched/mm.h>
+#include <linux/sort.h>
 #include <linux/swap.h>
 #include <linux/vmstat.h>
 
@@ -38,8 +39,8 @@
 
 struct tier_round {
 	bool promote;
-	bool src[NR_NODES];
-	bool dst[NR_NODES];
+	nodemask_t src;
+	nodemask_t dst;
 	int next_dst;
 	enum ftier_tiering_mode mode;
 	unsigned long max_pages;
@@ -51,32 +52,30 @@ struct tier_round {
 
 static void set_tiering_nodes(struct tier_round *r)
 {
-	int nid;
-
-	for (nid = 0; nid < NR_NODES; ++nid) {
-		r->src[nid] = r->promote ? CXL_NID(nid) : DRAM_NID(nid);
-		r->dst[nid] = r->promote ? DRAM_NID(nid) : CXL_NID(nid);
-	}
-	r->next_dst = 0;
+	r->src = r->promote ? ftier_cxl_nodes : ftier_dram_nodes;
+	r->dst = r->promote ? ftier_dram_nodes : ftier_cxl_nodes;
+	r->next_dst = NUMA_NO_NODE;
 }
 
+/* Round-robin over the destination tier. */
 static int next_dst_node(struct tier_round *r)
 {
-	int i, nid = r->next_dst;
+	int nid = next_node_in(r->next_dst, r->dst);
 
-	for (i = 0; i < NR_NODES; i++) {
-		nid = (nid + 1) % NR_NODES;
-		if (r->dst[nid]) {
-			r->next_dst = nid;
-			return nid;
-		}
-	}
-	return NUMA_NO_NODE;
+	if (nid >= MAX_NUMNODES)
+		return NUMA_NO_NODE;
+	r->next_dst = nid;
+	return nid;
 }
 
 static bool src_node(const struct tier_round *r, int nid)
 {
-	return nid >= 0 && nid < NR_NODES && r->src[nid];
+	return nid >= 0 && nid < MAX_NUMNODES && node_isset(nid, r->src);
+}
+
+static bool dst_node(const struct tier_round *r, int nid)
+{
+	return nid >= 0 && nid < MAX_NUMNODES && node_isset(nid, r->dst);
 }
 
 /* ---------------------------------------------------------------------
@@ -136,7 +135,7 @@ static void gather_folio(struct gather *g, struct folio *folio)
 	g->last = folio;
 
 	if (!src_node(g->r, nid)) {
-		if (nid >= 0 && nid < NR_NODES && g->r->dst[nid])
+		if (dst_node(g->r, nid))
 			g->nr_dst += folio_nr_pages(folio);
 		return;
 	}
@@ -466,64 +465,322 @@ static long tier_region(struct tier_round *r, struct ftier_hot *hot)
 	return ret;
 }
 
-static unsigned long migrate_credit;	/* pages, carried across ticks */
+/*
+ * Candidates are taken from the Hotlist starting level_off levels below
+ * the hottest non-empty level and going colder. Handled entries move to
+ * the tail of their bucket, so consecutive rounds use the remaining
+ * entries of a level before revisiting any.
+ */
+static struct ftier_hot *cands[FTIER_MAX_CANDIDATES];
+static u32 cand_hot[FTIER_MAX_CANDIDATES];
+
+static unsigned int collect_candidates(struct ftier_hotlist *hl, bool promote,
+				       unsigned int max, unsigned int *first)
+{
+	unsigned int level, top, n = 0;
+	struct ftier_hot *hot;
+
+	for (top = FTIER_HOT_LEVELS; top-- > 0; )
+		if (hl->nr[ftier_hotlist_pos(hl, top)])
+			break;
+	if (top >= FTIER_HOT_LEVELS)
+		return 0;
+	level = top > ftier_ctx.level_off ? top - ftier_ctx.level_off : 0;
+	*first = level;
+
+	for (level++; level-- > 0; ) {
+		list_for_each_entry(hot, &hl->bucket[ftier_hotlist_pos(hl, level)],
+				    link) {
+			if (region_has_no_src(hl, hot, promote))
+				continue;
+			cand_hot[n] = ftier_hot_effective(hl, hot);
+			cands[n++] = hot;
+			if (n == max)
+				return n;
+		}
+	}
+	return n;
+}
+
+static int cmp_u32(const void *a, const void *b)
+{
+	u32 x = *(const u32 *)a, y = *(const u32 *)b;
+
+	return x < y ? -1 : x > y;
+}
+
+/*
+ * Hint-fault latency threshold for a round: 1/h for the median access
+ * frequency h of the selected regions. In steady state the hotness of an
+ * entry averages 1.5x the accesses counted per cooling period, so
+ * h = hotness / (1.5 * cool_ms) accesses per ms.
+ */
+static int round_threshold_ms(u32 *hot, unsigned int n)
+{
+	u32 median;
+	u64 ms;
+
+	if (FTIER_CFG(hint_mode) == FTIER_HINT_FIXED || !n)
+		return FTIER_CFG(hint_max_ms);
+	sort(hot, n, sizeof(*hot), cmp_u32, NULL);
+	median = max(hot[n / 2], 1U);
+	ms = div_u64(3ULL * FTIER_CFG(cool_ms), 2 * median);
+	return clamp_t(u64, ms, FTIER_CFG(hint_min_ms), FTIER_CFG(hint_max_ms));
+}
+
+/* ---------------------------------------------------------------------
+ * Tier state and the adaptive hotness level.
+ */
+
+struct ftier_tier_state ftier_tier = {
+	.lock = __SPIN_LOCK_UNLOCKED(ftier_tier.lock),
+};
+
+/**
+ * ftier_report_tier_state - report a measurement of the memory tiers
+ * @sample: latest measurement and the migration rate it calls for
+ *
+ * For tier latency monitors. Sets sysctl_promote_mb and lets FTier adapt
+ * the hotness of its migration candidates to the latency response. May
+ * be called from any context.
+ */
+void ftier_report_tier_state(const struct ftier_tier_sample *sample)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&ftier_tier.lock, flags);
+	ftier_tier.sample = *sample;
+	ftier_tier.time_ns = ktime_get_ns();
+	spin_unlock_irqrestore(&ftier_tier.lock, flags);
+	WRITE_ONCE(sysctl_promote_mb, sample->promote_mb);
+	trace_ftier_tier(sample->dram_lat, sample->cxl_lat, sample->dram_mbps,
+			 sample->cxl_mbps, sample->promote_mb);
+}
+EXPORT_SYMBOL_GPL(ftier_report_tier_state);
+
+/*
+ * Migration rate for this tick, and the signed tier imbalance in per
+ * mille (> 0: DRAM is faster, promotion helps). Without a fresh latency
+ * report, the requested rate stands in for the imbalance: monitors such
+ * as Colloid make it proportional to the latency gap.
+ */
+static int tier_signal(u64 now, int *gap)
+{
+	u64 period = (u64)FTIER_CFG(level_period_ms) * NSEC_PER_MSEC;
+	u64 timeout = (u64)FTIER_CFG(monitor_timeout_ms) * NSEC_PER_MSEC;
+	int rate = READ_ONCE(sysctl_promote_mb);
+	unsigned int cap = max(FTIER_CFG(max_migrate_mbps), 1U);
+	struct ftier_tier_sample s;
+	unsigned long flags;
+	u64 t;
+	s64 g;
+
+	spin_lock_irqsave(&ftier_tier.lock, flags);
+	s = ftier_tier.sample;
+	t = ftier_tier.time_ns;
+	spin_unlock_irqrestore(&ftier_tier.lock, flags);
+
+	if (timeout && t && now - t > timeout) {
+		/* The monitor stopped reporting: do not act on stale data. */
+		ftier_ctx.stats.nr_monitor_stale++;
+		*gap = 0;
+		return 0;
+	}
+	if (t && now - t <= 2 * period && s.dram_lat && s.cxl_lat)
+		g = div64_s64(((s64)s.cxl_lat - (s64)s.dram_lat) * 1000,
+			      (s64)s.dram_lat);
+	else
+		g = (s64)rate * 1000 / cap;
+	*gap = clamp_t(s64, g, -10000, 10000);
+	return rate;
+}
+
+enum { LEVEL_KEEP, LEVEL_OVERSHOOT, LEVEL_SENSITIVE, LEVEL_SLOW };
+
+/*
+ * Once per level period: if migration flipped the sign of the imbalance,
+ * or moved it a lot with little data, the selected regions are too hot
+ * for fine control, so select colder ones. If migrating near the
+ * permitted rate barely reduced the imbalance, select hotter ones.
+ */
+static void adapt_level(u64 now, int gap, unsigned long cap_pages)
+{
+	int prev = ftier_ctx.gap_prev, dead = FTIER_CFG(level_deadband_pm);
+	unsigned long pct;
+	int reason = LEVEL_KEEP;
+
+	if (!FTIER_CFG(level_adapt)) {
+		ftier_ctx.level_off = 0;
+		return;
+	}
+	if (now < ftier_ctx.level_next_ns)
+		return;
+
+	pct = cap_pages ? ftier_ctx.level_pages * 100 / cap_pages : 0;
+	if (abs(prev) > dead && abs(gap) > dead && (gap ^ prev) < 0)
+		reason = LEVEL_OVERSHOOT;
+	else if (abs(prev) > dead && ftier_ctx.level_pages &&
+		 pct < FTIER_CFG(level_small_pct) &&
+		 abs(prev - gap) * 100 > FTIER_CFG(level_jump_pct) * abs(prev))
+		reason = LEVEL_SENSITIVE;
+	else if (abs(gap) > dead && pct >= FTIER_CFG(level_full_pct) &&
+		 (abs(prev) - abs(gap)) * 100 <
+		 (int)FTIER_CFG(level_progress_pct) * abs(prev))
+		reason = LEVEL_SLOW;
+
+	if (reason == LEVEL_SLOW && ftier_ctx.level_off) {
+		ftier_ctx.level_off--;
+		ftier_ctx.stats.nr_level_hotter++;
+	} else if ((reason == LEVEL_OVERSHOOT || reason == LEVEL_SENSITIVE) &&
+		   ftier_ctx.level_off < FTIER_HOT_LEVELS - 1) {
+		ftier_ctx.level_off++;
+		ftier_ctx.stats.nr_level_colder++;
+	}
+	trace_flevel(ftier_ctx.level_off, gap, prev, pct, reason);
+
+	ftier_ctx.gap_prev = gap;
+	ftier_ctx.level_pages = 0;
+	ftier_ctx.level_next_ns = now +
+		(u64)FTIER_CFG(level_period_ms) * NSEC_PER_MSEC;
+}
+
+/* ---------------------------------------------------------------------
+ * The tiering tick.
+ */
+
+static unsigned long migrate_credit;	/* demand mode, pages */
+static long hint_migrated_seen;		/* ftier_hint.nr_migrate consumed */
+
+void ftier_tier_reset(void)
+{
+	migrate_credit = 0;
+	hint_migrated_seen = 0;
+	ftier_ctx.level_off = 0;
+	ftier_ctx.gap_prev = 0;
+	ftier_ctx.level_next_ns = 0;
+	ftier_ctx.level_pages = 0;
+	ftier_ctx.round_end_ns = 0;
+	ftier_ctx.tier_ival_end_ns = 0;
+	ftier_ctx.ival_target = 0;
+	ftier_ctx.ival_done = 0;
+	ftier_hint_reset();
+}
+
+/* Handle candidates until @max_pages or the time budget is reached. */
+static unsigned int tier_candidates(struct tier_round *r, unsigned int n,
+				    u64 t0, u64 budget_ns)
+{
+	struct ftier_hotlist *hl = &ftier_ctx.hotlist;
+	unsigned int i, nr_hot = 0;
+	long ret;
+
+	for (i = 0; i < n && r->nr_pages < r->max_pages; i++) {
+		ret = tier_region(r, cands[i]);
+		r->nr_regions++;
+		if (ret > 0) {
+			r->nr_pages += ret;
+			cand_hot[nr_hot++] = cand_hot[i];
+		}
+		ftier_hotlist_rotate(hl, cands[i]);
+		if (ktime_get_ns() - t0 >= budget_ns)
+			break;
+	}
+	return nr_hot;
+}
 
 void ftier_tier_tick(unsigned int tick_ms, u64 budget_ns)
 {
 	struct ftier_hotlist *hl = &ftier_ctx.hotlist;
-	int rate = READ_ONCE(sysctl_promote_mb);
-	unsigned long mbps, credit_max;
+	unsigned long mbps, credit_max, cap_pages;
+	unsigned int n, nr_hot, first = 0;
 	struct tier_round r = {};
-	struct ftier_hot *hot;
-	u64 t0 = ktime_get_ns(), elapsed = 0;
-	unsigned int level, last_level = 0;
-	long ret;
+	u64 t0 = ktime_get_ns(), elapsed;
+	long migrated;
+	int rate, gap, thresh;
 
+	rate = tier_signal(t0, &gap);
 	mbps = min_t(unsigned long, abs(rate), FTIER_CFG(max_migrate_mbps));
+	r.promote = rate > 0;
+	r.mode = READ_ONCE(sysctl_tiering_mode);
+	set_tiering_nodes(&r);
+
+	/* Pages moved per level period at the permitted rate. */
+	cap_pages = (mbps << (20 - PAGE_SHIFT)) * FTIER_CFG(level_period_ms) /
+		    MSEC_PER_SEC;
+	credit_max = mbps << (20 - PAGE_SHIFT);	/* one second worth */
+
+	if (r.mode == HINT_FAULT) {
+		migrated = atomic_long_read(&ftier_hint.nr_migrate);
+		ftier_ctx.ival_done += migrated - hint_migrated_seen;
+		ftier_ctx.level_pages += migrated - hint_migrated_seen;
+		hint_migrated_seen = migrated;
+		ftier_hint_refill(mbps ? credit_max * tick_ms / MSEC_PER_SEC
+				       : -credit_max, credit_max);
+	}
+	adapt_level(t0, gap, cap_pages);
+
 	if (!mbps) {
 		migrate_credit = 0;
+		ftier_ctx.ival_target = 0;
 		return;
 	}
 
-	/* Rate limit with up to one second worth of accumulated credit. */
-	credit_max = mbps << (20 - PAGE_SHIFT);
-	migrate_credit = min(credit_max,
-			     migrate_credit + credit_max * tick_ms / 1000);
-
-	r.promote = rate > 0;
-	r.mode = READ_ONCE(sysctl_tiering_mode);
-	r.max_pages = migrate_credit;
-	set_tiering_nodes(&r);
-
-	/* The Hotlist only changes under ftier_lock, which we hold. */
-	ftier_for_each_hot(hl, level, hot) {
-		if (region_has_no_src(hl, hot, r.promote))
-			continue;
-		last_level = level;
-		ret = tier_region(&r, hot);
-		r.nr_regions++;
-		if (ret > 0)
-			r.nr_pages += ret;
-		elapsed = ktime_get_ns() - t0;
-		if (r.nr_pages >= r.max_pages || elapsed >= budget_ns)
-			goto out;
-	}
-	elapsed = ktime_get_ns() - t0;
-out:
-	migrate_credit -= min(migrate_credit, r.nr_pages);
-
 	if (r.mode == DEMAND_MIGRATE) {
+		migrate_credit = min(credit_max,
+				     migrate_credit + credit_max * tick_ms /
+						      MSEC_PER_SEC);
+		r.max_pages = migrate_credit;
+		n = collect_candidates(hl, r.promote,
+				       FTIER_CFG(max_candidates), &first);
+		tier_candidates(&r, n, t0, budget_ns);
+		migrate_credit -= min(migrate_credit, r.nr_pages);
+		ftier_ctx.level_pages += r.nr_pages;
 		if (r.promote)
 			ftier_ctx.stats.nr_promoted += r.nr_pages;
 		else
 			ftier_ctx.stats.nr_demoted += r.nr_pages;
+		goto out;
 	}
+
+	/*
+	 * Hint-fault mode: migration rounds, each protecting regions up to
+	 * the volume still due in this interval and lasting the latency
+	 * threshold of the round, until the interval volume is met.
+	 */
+	if (t0 >= ftier_ctx.tier_ival_end_ns) {
+		ftier_ctx.tier_ival_end_ns = t0 +
+			(u64)FTIER_CFG(interval_ms) * NSEC_PER_MSEC;
+		ftier_ctx.ival_target = (mbps << (20 - PAGE_SHIFT)) *
+					FTIER_CFG(interval_ms) / MSEC_PER_SEC;
+		ftier_ctx.ival_done = 0;
+	}
+	if (t0 < ftier_ctx.round_end_ns ||
+	    ftier_ctx.ival_done >= ftier_ctx.ival_target)
+		goto out;
+
+	r.max_pages = ftier_ctx.ival_target - ftier_ctx.ival_done;
+	n = collect_candidates(hl, r.promote, FTIER_CFG(max_candidates),
+			       &first);
+	nr_hot = tier_candidates(&r, n, t0, budget_ns);
+	if (!r.nr_regions)
+		goto out;
+	thresh = round_threshold_ms(cand_hot, nr_hot);
+	if (FTIER_CFG(hint_mode) != FTIER_HINT_HISTOGRAM)
+		ftier_hint_set_thresh(thresh);
+	ftier_ctx.round_end_ns = t0 + (u64)max_t(unsigned int, thresh, tick_ms) *
+				      NSEC_PER_MSEC;
+	ftier_ctx.stats.nr_rounds++;
+	trace_fround(ftier_ctx.stats.nr_rounds, r.nr_regions, r.nr_pages,
+		     nr_hot ? cand_hot[nr_hot / 2] : 0, thresh, first);
+
+out:
+	elapsed = ktime_get_ns() - t0;
 	ftier_ctx.stats.nr_migrate_fail += r.nr_failed;
 	ftier_ctx.stats.nr_tier_ticks++;
 	ftier_ctx.stats.tier_ns += elapsed;
 
 	trace_fmigrate(r.nr_regions, r.nr_skipped, r.nr_pages, r.nr_failed,
 		       div_u64(budget_ns, NSEC_PER_USEC),
-		       div_u64(elapsed, NSEC_PER_USEC), last_level, r.promote,
+		       div_u64(elapsed, NSEC_PER_USEC), first, r.promote,
 		       r.max_pages);
 }

@@ -10,15 +10,11 @@
 #ifndef _LINUX_FTIER_H
 #define _LINUX_FTIER_H
 
+#include <linux/nodemask.h>
 #include <linux/types.h>
 
 struct folio;
 struct mm_struct;
-
-/* Machine specific: DRAM node 1, CXL nodes 2 and 3 on the test server. */
-#define CXL_NID(nid) ((nid) > 1)
-#define DRAM_NID(nid) ((nid) == 1)
-#define NR_NODES 4
 
 /*
  * Kept for out-of-tree latency monitors that scale sysctl_promote_mb by
@@ -52,15 +48,69 @@ enum ftier_tiering_mode {
  */
 extern int sysctl_promote_mb;
 extern enum ftier_tiering_mode sysctl_tiering_mode;
-extern int sysctl_pass_ratio_bp;
+
+/**
+ * struct ftier_tier_sample - one measurement of the memory tiers
+ * @dram_lat: mean loaded access latency of the DRAM tier
+ * @cxl_lat: mean loaded access latency of the CXL tier, same unit
+ * @dram_mbps: DRAM tier bandwidth in MB/s, 0 if unknown
+ * @cxl_mbps: CXL tier bandwidth in MB/s, 0 if unknown
+ * @promote_mb: requested migration rate, as sysctl_promote_mb
+ */
+struct ftier_tier_sample {
+	u64 dram_lat;
+	u64 cxl_lat;
+	u64 dram_mbps;
+	u64 cxl_mbps;
+	int promote_mb;
+};
 
 #ifdef CONFIG_FTIER
+/* Tier membership; see /sys/kernel/mm/ftier/{dram,cxl}_nodes. */
+extern nodemask_t ftier_dram_nodes;
+extern nodemask_t ftier_cxl_nodes;
+
+static inline bool ftier_node_is_dram(int nid)
+{
+	return nid >= 0 && nid < MAX_NUMNODES && node_isset(nid, ftier_dram_nodes);
+}
+
+static inline bool ftier_node_is_cxl(int nid)
+{
+	return nid >= 0 && nid < MAX_NUMNODES && node_isset(nid, ftier_cxl_nodes);
+}
+
 bool ftier_mm_is_target(struct mm_struct *mm);
+int ftier_hint_fault(struct folio *folio);
+void ftier_report_tier_state(const struct ftier_tier_sample *sample);
 #else
+static inline bool ftier_node_is_dram(int nid)
+{
+	return false;
+}
+
+static inline bool ftier_node_is_cxl(int nid)
+{
+	return false;
+}
+
 static inline bool ftier_mm_is_target(struct mm_struct *mm)
 {
 	return false;
 }
+
+static inline int ftier_hint_fault(struct folio *folio)
+{
+	return NUMA_NO_NODE;
+}
+
+static inline void ftier_report_tier_state(const struct ftier_tier_sample *s)
+{
+}
 #endif
+
+/* Pre-nodemask names, kept for out-of-tree users. */
+#define DRAM_NID(nid)	ftier_node_is_dram(nid)
+#define CXL_NID(nid)	ftier_node_is_cxl(nid)
 
 #endif /* _LINUX_FTIER_H */

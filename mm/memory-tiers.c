@@ -74,7 +74,7 @@ bool folio_use_access_time(struct folio *folio)
 	if (READ_ONCE(sysctl_tiering_mode) == HINT_FAULT) {
 		int nid = folio_nid(folio);
 
-		if (DRAM_NID(nid) || CXL_NID(nid))
+		if (ftier_node_is_dram(nid) || ftier_node_is_cxl(nid))
 			return true;
 	}
 #endif

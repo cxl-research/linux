@@ -79,7 +79,6 @@
 #include <linux/ftier.h>
 
 #include <trace/events/kmem.h>
-#include <trace/events/ftier.h>
 
 #include <asm/io.h>
 #include <asm/mmu_context.h>
@@ -5737,164 +5736,6 @@ static vm_fault_t do_fault(struct vm_fault *vmf)
 	return ret;
 }
 
-#ifdef CONFIG_FTIER
-/* Stores histogram of FTier fault latencies
- *  ___________________________________________________
- * |0|1|2|...|999|1000|1001|...|1017|1018|...|1022|1023|
- * ----------------------------------------------------
- * Indices 0-999 save latencies in ms
- * Index 1000-1017 save latencies in 500 ms till 10s
- * Index 1018-1023 save latencies above 10,20,...,60s
- * Values halved every second to age out old data
- */
-#define FLT_LAT_HIST_LEN 1024
-static unsigned int FLT_LAT_HIST_DRAM[FLT_LAT_HIST_LEN];
-static unsigned int FLT_LAT_HIST_CXL[FLT_LAT_HIST_LEN];
-static int last_histogram_aged_timestamp = 0;
-static int dram_flt_lat_thresh_ms = 60000;
-static int cxl_flt_lat_thresh_ms = 60000;
-
-static int hist_lat_idx(int latency)
-{
-	if (latency < 1000)
-		return latency;
-	else if (latency < 10000)
-		return 1000 + (latency - 1000) / 500;
-	else
-		return 1018 + min((latency - 10000) / 10000, 5);
-}
-
-static int hist_idx_lat(int index)
-{
-	if (index < 1000)
-		return index;
-	else if (index < 1018)
-		return 1000 + (index - 1000) * 500;
-	else
-		return 10000 + (index - 1018) * 10000;
-}
-
-static void update_fault_latency_histogram(int latency, bool cxl)
-{
-	int index;
-	index = hist_lat_idx(latency);
-	if (!cxl)
-		FLT_LAT_HIST_DRAM[index]++;
-	else
-		FLT_LAT_HIST_CXL[index]++;
-}
-
-/* Called with the PTE lock held: must not sleep. */
-static DEFINE_SPINLOCK(flt_hist_lock);
-
-static void check_age_fault_latency_histogram(void)
-{
-	int i, now, diff, threshold = 0;
-	long cumsum = 0, newcumsum = 0;
-
-	now = jiffies_to_msecs(jiffies);
-	diff = now - last_histogram_aged_timestamp;
-	if (diff < 1000)
-		return;
-
-	if (!spin_trylock(&flt_hist_lock))
-		return;
-	trace_fhint(-1, dram_flt_lat_thresh_ms, cxl_flt_lat_thresh_ms);
-	for (i = 0; i < FLT_LAT_HIST_LEN; i++) {
-		trace_fhint(i, FLT_LAT_HIST_DRAM[i], FLT_LAT_HIST_CXL[i]);
-	}
-
-	/* After 32 halvings every u32 bucket is zero anyway. */
-	for (diff = min(diff / 1000, 32); diff > 0; diff--) {
-		for (i = 0; i < FLT_LAT_HIST_LEN; i++) {
-			FLT_LAT_HIST_DRAM[i] >>= 1;
-			FLT_LAT_HIST_CXL[i] >>= 1;
-		}
-	}
-
-	for (i = 0; i < FLT_LAT_HIST_LEN; i++) {
-		cumsum += FLT_LAT_HIST_DRAM[i];
-	}
-	newcumsum = (cumsum * sysctl_pass_ratio_bp) / 10000;
-	for (i = 0; i < FLT_LAT_HIST_LEN; i++) {
-		newcumsum -= FLT_LAT_HIST_DRAM[i];
-		if (newcumsum <= 0) {
-			threshold = hist_idx_lat(i);
-			break;
-		}
-	}
-	if (threshold)
-		dram_flt_lat_thresh_ms = threshold;
-	else
-		dram_flt_lat_thresh_ms = 60000; /* Maximum */
-
-	cumsum = newcumsum = threshold = 0;
-	for (i = 0; i < FLT_LAT_HIST_LEN; i++) {
-		cumsum += FLT_LAT_HIST_CXL[i];
-	}
-	newcumsum = (cumsum * sysctl_pass_ratio_bp) / 10000;
-	for (i = 0; i < FLT_LAT_HIST_LEN; i++) {
-		newcumsum -= FLT_LAT_HIST_CXL[i];
-		if (newcumsum <= 0) {
-			threshold = hist_idx_lat(i);
-			break;
-		}
-	}
-	if (threshold)
-		cxl_flt_lat_thresh_ms = threshold;
-	else
-		cxl_flt_lat_thresh_ms = 60000; /* Maximum */
-
-	last_histogram_aged_timestamp = jiffies_to_msecs(jiffies);
-	spin_unlock(&flt_hist_lock);
-}
-
-static int ftier_hint_fault_latency(struct folio *folio)
-{
-	int last_time, time;
-	time = jiffies_to_msecs(jiffies);
-	last_time = folio_xchg_access_time(folio, time);
-	return (time - last_time) & PAGE_ACCESS_TIME_MASK;
-}
-
-static int ftier_migrate_check(struct folio *folio)
-{
-	int idx, src_nid, latency;
-	static int target_nid = 0;
-	bool promote;
-
-	if (!sysctl_promote_mb)
-		return NUMA_NO_NODE;
-
-	src_nid = folio_nid(folio);
-	promote = (sysctl_promote_mb > 0);
-	/* Only migrate folios that sit on the source tier of this direction. */
-	if ((promote && !CXL_NID(src_nid)) || (!promote && !DRAM_NID(src_nid)))
-		return NUMA_NO_NODE;
-
-	latency = ftier_hint_fault_latency(folio);
-	update_fault_latency_histogram(latency, CXL_NID(src_nid));
-	check_age_fault_latency_histogram();
-	// if (latency >= sysctl_hint_fault_latency_threshold_ms)
-	// 	return NUMA_NO_NODE;
-	if ((DRAM_NID(src_nid) && (latency > dram_flt_lat_thresh_ms)) ||
-	    (CXL_NID(src_nid) && (latency > cxl_flt_lat_thresh_ms)))
-		return NUMA_NO_NODE;
-
-	for (idx = 0; idx < NR_NODES; idx++) {
-		target_nid = (target_nid + 1) % NR_NODES;
-		if (!promote && CXL_NID(target_nid))
-			break;
-		if (promote && DRAM_NID(target_nid))
-			break;
-	}
-
-	if (idx == NR_NODES)
-		return NUMA_NO_NODE;
-
-	return target_nid;
-}
-#endif /* CONFIG_FTIER */
 
 int numa_migrate_check(struct folio *folio, struct vm_fault *vmf,
 		      unsigned long addr, int *flags,
@@ -5940,11 +5781,10 @@ int numa_migrate_check(struct folio *folio, struct vm_fault *vmf,
 		*flags |= TNF_FAULT_LOCAL;
 	}
 
-#ifdef CONFIG_FTIER
-	if (READ_ONCE(sysctl_tiering_mode) == HINT_FAULT &&
+	if (IS_ENABLED(CONFIG_FTIER) &&
+	    READ_ONCE(sysctl_tiering_mode) == HINT_FAULT &&
 	    ftier_mm_is_target(vma->vm_mm))
-		return ftier_migrate_check(folio);
-#endif
+		return ftier_hint_fault(folio);
 
 	return mpol_misplaced(folio, vmf, addr);
 }

@@ -23,6 +23,7 @@
 #include <linux/hashtable.h>
 #include <linux/hrtimer.h>
 #include <linux/kthread.h>
+#include <linux/memory-tiers.h>
 #include <linux/mm.h>
 #include <linux/mmu_notifier.h>
 #include <linux/oom.h>
@@ -56,7 +57,59 @@ struct ftier_config ftier_cfg = {
 	.flush_tlb		= FTIER_FLUSH_NEVER,
 	.migrate_batch		= 512,
 	.max_migrate_mbps	= 1024,
+	.max_candidates		= 256,
+	.hint_mode		= FTIER_HINT_MEDIAN,
+	.hint_min_ms		= 1,
+	.hint_max_ms		= 1000,
+	.hint_pass_bp		= 10000,
+	.level_adapt		= true,
+	.level_period_ms	= 1000,
+	.level_small_pct	= 25,
+	.level_full_pct		= 90,
+	.level_jump_pct		= 50,
+	.level_progress_pct	= 10,
+	.level_deadband_pm	= 20,
+	.monitor_timeout_ms	= 0,
 };
+
+nodemask_t ftier_dram_nodes;
+nodemask_t ftier_cxl_nodes;
+EXPORT_SYMBOL_GPL(ftier_dram_nodes);
+EXPORT_SYMBOL_GPL(ftier_cxl_nodes);
+
+/*
+ * Default tiers. The FTier evaluation server has DRAM node 1 (node 0
+ * runs everything else) and CPU-less CXL nodes 2 and 3: keep that layout
+ * where it applies. Otherwise, memory nodes in the top memory tier are
+ * DRAM and the remaining memory nodes are CXL.
+ */
+int ftier_nodes_init(void)
+{
+	nodemask_t dram = NODE_MASK_NONE, cxl = NODE_MASK_NONE;
+	int nid;
+
+	for_each_node_state(nid, N_MEMORY) {
+		if (nid > 1 && !node_state(nid, N_CPU))
+			node_set(nid, cxl);
+	}
+	if (node_state(1, N_MEMORY) && node_state(1, N_CPU) &&
+	    !nodes_empty(cxl)) {
+		node_set(1, dram);
+	} else {
+		nodes_clear(cxl);
+		for_each_node_state(nid, N_MEMORY) {
+			if (node_is_toptier(nid))
+				node_set(nid, dram);
+			else
+				node_set(nid, cxl);
+		}
+	}
+	ftier_dram_nodes = dram;
+	ftier_cxl_nodes = cxl;
+	pr_info("ftier: DRAM nodes %*pbl, CXL nodes %*pbl\n",
+		nodemask_pr_args(&dram), nodemask_pr_args(&cxl));
+	return 0;
+}
 
 struct ftier_ctx ftier_ctx = {
 	.spaces = LIST_HEAD_INIT(ftier_ctx.spaces),
@@ -377,8 +430,12 @@ static int ftier_main_fn(void *unused)
 
 		elapsed = ktime_get_ns() - t0;
 		budget_ns = tick_ns * 9 / 10;
-		if (READ_ONCE(ftier_ctx.tiering) && elapsed < budget_ns)
-			ftier_tier_tick(FTIER_CFG(tick_ms), budget_ns - elapsed);
+		if (READ_ONCE(ftier_ctx.tiering)) {
+			ftier_hint_age();
+			if (elapsed < budget_ns)
+				ftier_tier_tick(FTIER_CFG(tick_ms),
+						budget_ns - elapsed);
+		}
 
 		elapsed = ktime_get_ns() - t0;
 		if (elapsed > tick_ns)
@@ -475,6 +532,9 @@ int ftier_set_target_cgroup(const char *path)
 void ftier_set_tiering(bool on)
 {
 	WRITE_ONCE(ftier_ctx.tiering, on);
+	/* Pages protected earlier must not migrate once tiering stops. */
+	if (!on)
+		atomic_long_set(&ftier_hint.credit, 0);
 }
 
 /* Called with ftier_state_lock held. */
@@ -494,6 +554,7 @@ int ftier_start(void)
 
 	mutex_lock(&ftier_lock);
 	ftier_hotlist_init(&ftier_ctx.hotlist);
+	ftier_tier_reset();
 	memset(&ftier_ctx.stats, 0, sizeof(ftier_ctx.stats));
 	now = ktime_get_ns();
 	ftier_ctx.next_fscan_ns = now;
@@ -522,7 +583,7 @@ void ftier_stop(void)
 	if (!ftier_ctx.task)
 		return;
 
-	WRITE_ONCE(ftier_ctx.tiering, false);
+	ftier_set_tiering(false);
 	kthread_stop(ftier_ctx.task);
 	ftier_ctx.task = NULL;
 

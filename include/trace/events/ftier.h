@@ -196,6 +196,101 @@ TRACE_EVENT(fregion,
 		  __entry->nr_isolated, __entry->nr_done)
 );
 
+/* A tier measurement reported by a latency monitor. */
+TRACE_EVENT(ftier_tier,
+
+	TP_PROTO(u64 dram_lat, u64 cxl_lat, u64 dram_mbps, u64 cxl_mbps,
+		 int promote_mb),
+
+	TP_ARGS(dram_lat, cxl_lat, dram_mbps, cxl_mbps, promote_mb),
+
+	TP_STRUCT__entry(
+		__field(u64, dram_lat)
+		__field(u64, cxl_lat)
+		__field(u64, dram_mbps)
+		__field(u64, cxl_mbps)
+		__field(int, promote_mb)
+	),
+
+	TP_fast_assign(
+		__entry->dram_lat = dram_lat;
+		__entry->cxl_lat = cxl_lat;
+		__entry->dram_mbps = dram_mbps;
+		__entry->cxl_mbps = cxl_mbps;
+		__entry->promote_mb = promote_mb;
+	),
+
+	TP_printk("dram_lat=%llu, cxl_lat=%llu, dram_mbps=%llu,"
+		  " cxl_mbps=%llu, promote_mb=%d",
+		  __entry->dram_lat, __entry->cxl_lat, __entry->dram_mbps,
+		  __entry->cxl_mbps, __entry->promote_mb)
+);
+
+/* Adaptation of the hotness level of migration candidates. */
+TRACE_EVENT(flevel,
+
+	TP_PROTO(unsigned int level_off, int gap_pm, int prev_gap_pm,
+		 unsigned long moved_pct, int reason),
+
+	TP_ARGS(level_off, gap_pm, prev_gap_pm, moved_pct, reason),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, level_off)
+		__field(int, gap_pm)
+		__field(int, prev_gap_pm)
+		__field(unsigned long, moved_pct)
+		__field(int, reason)
+	),
+
+	TP_fast_assign(
+		__entry->level_off = level_off;
+		__entry->gap_pm = gap_pm;
+		__entry->prev_gap_pm = prev_gap_pm;
+		__entry->moved_pct = moved_pct;
+		__entry->reason = reason;
+	),
+
+	TP_printk("level_off=%u, gap=%d, prev_gap=%d, moved=%lu%%, %s",
+		  __entry->level_off, __entry->gap_pm, __entry->prev_gap_pm,
+		  __entry->moved_pct,
+		  __print_symbolic(__entry->reason, { 0, "keep" },
+				   { 1, "overshoot" }, { 2, "sensitive" },
+				   { 3, "slow" }))
+);
+
+/* Start of a hint-fault migration round. */
+TRACE_EVENT(fround,
+
+	TP_PROTO(u64 round, unsigned int regions, unsigned long pages,
+		 u32 median_hot, int thresh_ms, unsigned int first_level),
+
+	TP_ARGS(round, regions, pages, median_hot, thresh_ms, first_level),
+
+	TP_STRUCT__entry(
+		__field(u64, round)
+		__field(unsigned int, regions)
+		__field(unsigned long, pages)
+		__field(u32, median_hot)
+		__field(int, thresh_ms)
+		__field(unsigned int, first_level)
+	),
+
+	TP_fast_assign(
+		__entry->round = round;
+		__entry->regions = regions;
+		__entry->pages = pages;
+		__entry->median_hot = median_hot;
+		__entry->thresh_ms = thresh_ms;
+		__entry->first_level = first_level;
+	),
+
+	TP_printk("round=%llu, regions=%u, pages=%lu, median_hot=%u,"
+		  " thresh_ms=%d, first_level=%u",
+		  __entry->round, __entry->regions, __entry->pages,
+		  __entry->median_hot, __entry->thresh_ms,
+		  __entry->first_level)
+);
+
 TRACE_EVENT(fhint,
 
 	TP_PROTO(int ms, unsigned int x, unsigned int y),
