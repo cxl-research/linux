@@ -269,9 +269,13 @@ static long demand_migrate(struct tier_round *r, struct mm_struct *mm,
 		set_residency(&ftier_ctx.hotlist, hot,
 			      r->promote ? !g.nr_dst : !g.nr_src,
 			      r->promote ? !g.nr_src : !g.nr_dst);
+		trace_fregion(hot->pud->space->tgid, start, r->promote, false,
+			      g.nr_src, g.nr_dst, 0, 0);
 		return 0;
 	}
 	done = migrate_gathered(r, &g.folios);
+	trace_fregion(hot->pud->space->tgid, start, r->promote, false,
+		      g.nr_src, g.nr_dst, g.nr_isolated, done);
 	r->nr_failed += g.nr_isolated - min(done, g.nr_isolated);
 	if (done == g.nr_src)
 		set_residency(&ftier_ctx.hotlist, hot, !r->promote, r->promote);
@@ -301,8 +305,13 @@ static long protect_pte_range(struct mmu_gather *tlb, struct tier_round *r,
 	arch_enter_lazy_mmu_mode();
 	for (; addr != end; pte++, addr += PAGE_SIZE) {
 		oldpte = ptep_get(pte);
-		if (!pte_present(oldpte) || pte_protnone(oldpte))
+		if (!pte_present(oldpte))
 			continue;
+		/* Protected earlier and still waiting for its hint fault. */
+		if (pte_protnone(oldpte)) {
+			(*nr_src)++;
+			continue;
+		}
 
 		folio = vm_normal_folio(vma, addr, oldpte);
 		if (!folio || folio_is_zone_device(folio) ||
@@ -375,10 +384,13 @@ static long protect_vma_range(struct tier_round *r, struct vm_area_struct *vma,
 			/* Only promotion: change_huge_pmd() skips top tier. */
 			if (!r->promote || next - addr != PMD_SIZE)
 				continue;
+			/* Returns 1 if it left the entry alone. */
 			ret = change_huge_pmd(&tlb, vma, pmd, addr, PAGE_NONE,
 					      MM_CP_PROT_NUMA);
-			if (ret > 0) {
+			if (ret == HPAGE_PMD_NR) {
 				pages += HPAGE_PMD_NR;
+				*nr_src += HPAGE_PMD_NR;
+			} else if (pmd_protnone(val)) {
 				*nr_src += HPAGE_PMD_NR;
 			}
 			continue;
@@ -423,6 +435,8 @@ static long hint_protect(struct tier_round *r, struct mm_struct *mm,
 	if (!nr_src)
 		set_residency(&ftier_ctx.hotlist, hot,
 			      !r->promote, r->promote);
+	trace_fregion(hot->pud->space->tgid, start, r->promote, true,
+		      nr_src, 0, 0, pages);
 	return pages;
 }
 

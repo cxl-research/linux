@@ -157,6 +157,45 @@ TRACE_EVENT(fmigrate,
 		  __entry->level, __entry->promote, __entry->max_pages)
 );
 
+/* One candidate region (PMD entry) handled by a tiering tick. */
+TRACE_EVENT(fregion,
+
+	TP_PROTO(int pid, unsigned long addr, bool promote, bool hint,
+		 unsigned long nr_src, unsigned long nr_dst,
+		 unsigned long nr_isolated, long nr_done),
+
+	TP_ARGS(pid, addr, promote, hint, nr_src, nr_dst, nr_isolated,
+		nr_done),
+
+	TP_STRUCT__entry(
+		__field(int, pid)
+		__field(unsigned long, addr)
+		__field(bool, promote)
+		__field(bool, hint)
+		__field(unsigned long, nr_src)
+		__field(unsigned long, nr_dst)
+		__field(unsigned long, nr_isolated)
+		__field(long, nr_done)
+	),
+
+	TP_fast_assign(
+		__entry->pid = pid;
+		__entry->addr = addr;
+		__entry->promote = promote;
+		__entry->hint = hint;
+		__entry->nr_src = nr_src;
+		__entry->nr_dst = nr_dst;
+		__entry->nr_isolated = nr_isolated;
+		__entry->nr_done = nr_done;
+	),
+
+	TP_printk("pid=%d, addr=%lx, promote=%d, hint=%d, src=%lu, dst=%lu,"
+		  " isolated=%lu, done=%ld",
+		  __entry->pid, __entry->addr, __entry->promote,
+		  __entry->hint, __entry->nr_src, __entry->nr_dst,
+		  __entry->nr_isolated, __entry->nr_done)
+);
+
 TRACE_EVENT(fhint,
 
 	TP_PROTO(int ms, unsigned int x, unsigned int y),
