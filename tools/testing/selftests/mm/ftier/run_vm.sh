@@ -4,7 +4,7 @@
 # Boot a kernel in QEMU with an emulated two-tier NUMA topology and run
 # ftier_vmtest.sh inside it.
 #
-#   run_vm.sh <bzImage> <logfile> [TESTS="..."] [CHURN=n]
+#   [FTIER_CHA_KO=ftier_cha.ko] run_vm.sh <bzImage> <logfile> [VAR=value...]
 #
 # Nodes 0-1 have CPUs and low HMAT latency; nodes 2-3 are CPU-less with
 # higher latency so the kernel places them in a lower memory tier.
@@ -28,6 +28,13 @@ for app in $("$WORK/root/bin/busybox" --list); do
 	[ "$app" = busybox ] || ln -sf busybox "$WORK/root/bin/$app"
 done
 cp "$WORK/ftier_hot" "$DIR/ftier_vmtest.sh" "$WORK/root/"
+# The CHA monitor module, tested for clean refusal (no CHA MSRs in a VM).
+if [ -n "${FTIER_CHA_KO:-}" ]; then
+	cp "$FTIER_CHA_KO" "$WORK/root/ftier_cha.ko"
+	set -- "$@" CHA=fail CHA_KO=/ftier_cha.ko
+else
+	set -- "$@" CHA=skip
+fi
 
 envs=""
 for kv in "$@"; do

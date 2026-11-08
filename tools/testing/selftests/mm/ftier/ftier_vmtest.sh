@@ -256,6 +256,43 @@ t_monitor() {
 	kill $HPID 2>/dev/null; wait $HPID 2>/dev/null
 }
 
+# The CHA latency monitor. CHA=fail where it cannot work (VMs have no
+# CHA MSRs): loading must fail without side effects.
+cha_load() { if [ -n "${CHA_KO:-}" ]; then insmod "$CHA_KO" "$@"; else modprobe ftier_cha "$@"; fi; }
+t_cha() {
+	[ "${CHA:-ok}" = skip ] && return
+	reset
+	if cha_load nr_cha=7 2>/dev/null; then
+		rmmod ftier_cha; fail cha_bad_param
+	else
+		pass cha_bad_param
+	fi
+	w promote_mb 17
+	if [ "${CHA:-ok}" = fail ]; then
+		if cha_load 2>/dev/null; then
+			rmmod ftier_cha; fail cha_refused
+		else
+			pass cha_refused
+		fi
+		check cha_refused_no_effect "$([ "$(cat $F/promote_mb)" = 17 ] && echo 1 || echo 0)"
+		return
+	fi
+	echo 1 > $T/events/ftier/ftier_tier/enable
+	start_hot_pg /tmp/cha.log -s $SIZE -H $SIZE -t 10 -b $SLOW
+	cha_load poll_ms=100 || { fail cha_load; kill $HPID; return; }
+	sleep 3
+	n=$(grep -c ' ftier_tier:' $T/trace)
+	check cha_samples "$([ "$n" -ge 15 ] && [ "$n" -le 45 ] && echo 1 || echo 0)" "n=$n in 3 s"
+	l=$(grep ' ftier_tier:' $T/trace | tail -1 | sed 's/.*ftier_tier: //')
+	cl=$(echo "$l" | sed 's/.*cxl_lat=\([0-9]*\).*/\1/')
+	cb=$(echo "$l" | sed 's/.*cxl_mbps=\([0-9]*\).*/\1/')
+	check cha_cxl_load "$([ "$cl" -gt 0 ] && [ "$cb" -gt 0 ] && echo 1 || echo 0)" "$l"
+	rmmod ftier_cha
+	check cha_unload_idle "$([ "$(cat $F/promote_mb)" = 0 ] && echo 1 || echo 0)" \
+		"promote_mb=$(cat $F/promote_mb)"
+	kill $HPID 2>/dev/null; wait $HPID 2>/dev/null
+}
+
 t_cgroup() {
 	reset
 	mkdir -p /sys/fs/cgroup/ftier
@@ -377,7 +414,7 @@ t_dmesg() {
 	fi
 }
 
-TESTS=${TESTS:-"sysfs invalid tracking promote_demand promote_hint promote_hint_fixed promote_hint_hist demote nodes level monitor cgroup exit trace churn dmesg"}
+TESTS=${TESTS:-"sysfs invalid tracking promote_demand promote_hint promote_hint_fixed promote_hint_hist demote nodes level monitor cgroup exit trace cha churn dmesg"}
 for t in $TESTS; do
 	echo "=== $t"
 	case $t in
