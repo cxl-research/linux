@@ -19,4 +19,18 @@ config FTIER
 
 	  If unsure, say N.
 
+config FTIER_CHA_MONITOR
+	tristate "FTier CHA tier latency monitor"
+	depends on FTIER && CPU_SUP_INTEL
+	default m
+	help
+	  A tier latency monitor for Intel Sapphire Rapids and Emerald
+	  Rapids. It measures the load latency of the DRAM and CXL tiers
+	  with the CHA uncore counters and requests promotion or demotion
+	  so that both tiers see the same latency (the Colloid rule).
+
+	  The module is called ftier_cha. It programs the CHA counters
+	  directly, so perf uncore_cha events must not be used while it is
+	  loaded.
+
 endmenu
