@@ -5941,7 +5941,8 @@ int numa_migrate_check(struct folio *folio, struct vm_fault *vmf,
 	}
 
 #ifdef CONFIG_FTIER
-	if (sysctl_tiering_mode == HINT_FAULT)
+	if (READ_ONCE(sysctl_tiering_mode) == HINT_FAULT &&
+	    ftier_mm_is_target(vma->vm_mm))
 		return ftier_migrate_check(folio);
 #endif
 

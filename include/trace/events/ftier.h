@@ -8,6 +8,7 @@
 #include <linux/types.h>
 #include <linux/tracepoint.h>
 
+/* PUD-level scan of one tracked process. */
 TRACE_EVENT(fscan,
 
 	TP_PROTO(int pid, unsigned int nr_fhot, unsigned int dur_us),
@@ -30,14 +31,15 @@ TRACE_EVENT(fscan,
 			__entry->pid, __entry->nr_fhot, __entry->dur_us)
 );
 
+/* End of a measurement interval of one page of PMD entries (AFS). */
 TRACE_EVENT(fspin,
 
 	TP_PROTO(int pid, unsigned long addr, unsigned int spins,
 		unsigned int spin_period_final_us, unsigned int dur_sum_us,
-		unsigned int hot, unsigned int mapped),
+		unsigned int hot, unsigned int mapped, unsigned int scale_pm),
 
 	TP_ARGS(pid, addr, spins, spin_period_final_us,
-			dur_sum_us, hot, mapped),
+			dur_sum_us, hot, mapped, scale_pm),
 
 	TP_STRUCT__entry(
 		__field(int, pid)
@@ -47,6 +49,7 @@ TRACE_EVENT(fspin,
 		__field(unsigned int, dur_sum_us)
 		__field(unsigned int, hot)
 		__field(unsigned int, mapped)
+		__field(unsigned int, scale_pm)
 	),
 
 	TP_fast_assign(
@@ -57,15 +60,18 @@ TRACE_EVENT(fspin,
 		__entry->dur_sum_us = dur_sum_us;
 		__entry->hot = hot;
 		__entry->mapped = mapped;
+		__entry->scale_pm = scale_pm;
 	),
 
 	TP_printk("pid=%d, addr=%lx, spins=%u, spin_period_final=%u us,"
-			" dur_sum=%u us, hot=%u, mapped=%u",
+			" dur_sum=%u us, hot=%u, mapped=%u, scale=%u.%03u",
 			__entry->pid, __entry->addr, __entry->spins,
 			__entry->spin_period_final_us, __entry->dur_sum_us,
-			__entry->hot, __entry->mapped)
+			__entry->hot, __entry->mapped,
+			__entry->scale_pm / 1000, __entry->scale_pm % 1000)
 );
 
+/* Hotlist level occupancy: @mb of tracked data at log2 hotness @hotval. */
 TRACE_EVENT(fhist,
 
 	TP_PROTO(unsigned int hotval, unsigned int mb),
@@ -85,43 +91,70 @@ TRACE_EVENT(fhist,
 	TP_printk("hotval=%u, mb=%u", __entry->hotval, __entry->mb)
 );
 
-TRACE_EVENT(fmigrate,
+/* Hotlist cooling step. */
+TRACE_EVENT(fhotlist,
 
-	TP_PROTO(int succ, int fail, int succpg, int failpg, int budget_us,
-			int dur_us, unsigned int thresh, bool promote, unsigned int max_pages),
+	TP_PROTO(u32 epoch, unsigned long nr_entries, u64 nr_discarded),
 
-	TP_ARGS(succ, fail, succpg, failpg, budget_us,
-			dur_us, thresh, promote, max_pages),
+	TP_ARGS(epoch, nr_entries, nr_discarded),
 
 	TP_STRUCT__entry(
-		__field(int, succ)
-		__field(int, fail)
-		__field(int, succpg)
-		__field(int, failpg)
-		__field(int, budget_us)
-		__field(int, dur_us)
-		__field(unsigned int, thresh)
-		__field(bool, promote)
-		__field(unsigned int, max_pages)
+		__field(u32, epoch)
+		__field(unsigned long, nr_entries)
+		__field(u64, nr_discarded)
 	),
 
 	TP_fast_assign(
-		__entry->succ = succ;
-		__entry->fail = fail;
-		__entry->succpg = succpg;
-		__entry->failpg = failpg;
+		__entry->epoch = epoch;
+		__entry->nr_entries = nr_entries;
+		__entry->nr_discarded = nr_discarded;
+	),
+
+	TP_printk("epoch=%u, entries=%lu, discarded=%llu",
+		  __entry->epoch, __entry->nr_entries, __entry->nr_discarded)
+);
+
+/* One tiering tick. */
+TRACE_EVENT(fmigrate,
+
+	TP_PROTO(unsigned int regions, unsigned int skipped,
+		 unsigned long pages, unsigned long failed,
+		 unsigned int budget_us, unsigned int dur_us,
+		 unsigned int level, bool promote, unsigned long max_pages),
+
+	TP_ARGS(regions, skipped, pages, failed, budget_us,
+		dur_us, level, promote, max_pages),
+
+	TP_STRUCT__entry(
+		__field(unsigned int, regions)
+		__field(unsigned int, skipped)
+		__field(unsigned long, pages)
+		__field(unsigned long, failed)
+		__field(unsigned int, budget_us)
+		__field(unsigned int, dur_us)
+		__field(unsigned int, level)
+		__field(bool, promote)
+		__field(unsigned long, max_pages)
+	),
+
+	TP_fast_assign(
+		__entry->regions = regions;
+		__entry->skipped = skipped;
+		__entry->pages = pages;
+		__entry->failed = failed;
 		__entry->budget_us = budget_us;
 		__entry->dur_us = dur_us;
-		__entry->thresh = thresh;
+		__entry->level = level;
 		__entry->promote = promote;
 		__entry->max_pages = max_pages;
 	),
 
-	TP_printk("succ=%d, fail=%d, succpg=%d, failpg=%d, budget_us=%d,"
-						" dur_us=%d, thresh=%u, promote=%d, max_pages=%u",
-			__entry->succ, __entry->fail, __entry->succpg,
-			__entry->failpg, __entry->budget_us, __entry->dur_us,
-			__entry->thresh, __entry->promote, __entry->max_pages)
+	TP_printk("regions=%u, skipped=%u, pages=%lu, failed=%lu,"
+		  " budget_us=%u, dur_us=%u, level=%u, promote=%d,"
+		  " max_pages=%lu",
+		  __entry->regions, __entry->skipped, __entry->pages,
+		  __entry->failed, __entry->budget_us, __entry->dur_us,
+		  __entry->level, __entry->promote, __entry->max_pages)
 );
 
 TRACE_EVENT(fhint,

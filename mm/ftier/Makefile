@@ -1,3 +1,3 @@
 # SPDX-License-Identifier: GPL-2.0
 
-obj-y	:= temptrack.o sysfs.o tiering.o
+obj-y	:= core.o afs.o hotlist.o tiering.o sysfs.o
