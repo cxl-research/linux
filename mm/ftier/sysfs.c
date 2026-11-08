@@ -8,6 +8,7 @@
 #include <linux/cgroup.h>
 #include <linux/kobject.h>
 #include <linux/mm.h>
+#include <linux/nodemask.h>
 #include <linux/pid.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
@@ -16,8 +17,6 @@
 
 enum ftier_status sysctl_ftier_status = FTIER_STATUS_OFF;
 enum ftier_tiering_mode sysctl_tiering_mode = DEMAND_MIGRATE;
-int sysctl_hint_fault_latency_threshold_ms = 1000; /* 1s */
-int sysctl_pass_ratio_bp = 10000; /* 100.00% */
 int sysctl_promote_mb;
 EXPORT_SYMBOL_GPL(sysctl_promote_mb);
 
@@ -227,9 +226,6 @@ static ssize_t _name##_store(struct kobject *kobj,			\
 static struct kobj_attribute _name##_attr = __ATTR_RW(_name)
 
 FTIER_INT_ATTR(promote_mb, sysctl_promote_mb, -102400, 102400);
-FTIER_INT_ATTR(hint_fault_latency_threshold_ms,
-	       sysctl_hint_fault_latency_threshold_ms, 1, 60000);
-FTIER_INT_ATTR(hf_pass_ratio_bp, sysctl_pass_ratio_bp, 0, 10000);
 
 static int ftier_cfg_validate(const struct ftier_config *c)
 {
@@ -238,6 +234,8 @@ static int ftier_cfg_validate(const struct ftier_config *c)
 	    c->init_period_us > c->max_period_us)
 		return -EINVAL;
 	if (c->tick_ms > c->interval_ms)
+		return -EINVAL;
+	if (c->hint_min_ms > c->hint_max_ms)
 		return -EINVAL;
 	return 0;
 }
@@ -321,6 +319,134 @@ FTIER_CFG_ATTR(max_fhot_pc, high_wm_pct, 1, 100, true);
 FTIER_BOOL_ATTR(track_thp, track_thp);
 FTIER_BOOL_ATTR(notify_secondary, notify_secondary);
 FTIER_CFG_ATTR(flush_tlb, flush_tlb, 0, FTIER_FLUSH_MAX, true);
+FTIER_CFG_ATTR(max_candidates, max_candidates, 1, FTIER_MAX_CANDIDATES, true);
+FTIER_CFG_ATTR(hint_min_ms, hint_min_ms, 1, 60000, true);
+FTIER_CFG_ATTR(hint_max_ms, hint_max_ms, 1, 60000, true);
+FTIER_CFG_ATTR(hint_pass_bp, hint_pass_bp, 0, 10000, true);
+/* Pre-rework names of the hint-fault threshold and pass ratio. */
+FTIER_CFG_ATTR(hint_fault_latency_threshold_ms, hint_max_ms, 1, 60000, true);
+FTIER_CFG_ATTR(hf_pass_ratio_bp, hint_pass_bp, 0, 10000, true);
+FTIER_BOOL_ATTR(level_adapt, level_adapt);
+FTIER_CFG_ATTR(level_period_ms, level_period_ms, 100, 60000, true);
+FTIER_CFG_ATTR(level_small_pct, level_small_pct, 0, 100, true);
+FTIER_CFG_ATTR(level_full_pct, level_full_pct, 1, 100, true);
+FTIER_CFG_ATTR(level_jump_pct, level_jump_pct, 1, 1000, true);
+FTIER_CFG_ATTR(level_progress_pct, level_progress_pct, 0, 100, true);
+FTIER_CFG_ATTR(level_deadband_pm, level_deadband_pm, 0, 10000, true);
+FTIER_CFG_ATTR(monitor_timeout_ms, monitor_timeout_ms, 0, 600000, true);
+
+static const char * const ftier_hint_mode_strs[] = {
+	[FTIER_HINT_MEDIAN] = "median",
+	[FTIER_HINT_FIXED] = "fixed",
+	[FTIER_HINT_HISTOGRAM] = "histogram",
+};
+
+static ssize_t hint_mode_show(struct kobject *kobj,
+			      struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%s\n",
+			  ftier_hint_mode_strs[FTIER_CFG(hint_mode)]);
+}
+
+static ssize_t hint_mode_store(struct kobject *kobj,
+			       struct kobj_attribute *attr,
+			       const char *buf, size_t count)
+{
+	int mode = sysfs_match_string(ftier_hint_mode_strs, buf);
+
+	if (mode < 0)
+		return -EINVAL;
+	WRITE_ONCE(ftier_cfg.hint_mode, mode);
+	return count;
+}
+static struct kobj_attribute hint_mode_attr = __ATTR_RW(hint_mode);
+
+static ssize_t hint_thresh_ms_show(struct kobject *kobj,
+				   struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", READ_ONCE(ftier_hint.thresh_ms));
+}
+static struct kobj_attribute hint_thresh_ms_attr = __ATTR_RO(hint_thresh_ms);
+
+/*
+ * "dram_lat cxl_lat dram_mbps cxl_mbps promote_mb": a tier measurement
+ * from a user space monitor, as ftier_report_tier_state().
+ */
+static ssize_t tier_report_store(struct kobject *kobj,
+				 struct kobj_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct ftier_tier_sample s;
+
+	if (sscanf(buf, "%llu %llu %llu %llu %d", &s.dram_lat, &s.cxl_lat,
+		   &s.dram_mbps, &s.cxl_mbps, &s.promote_mb) != 5)
+		return -EINVAL;
+	if (s.promote_mb < -102400 || s.promote_mb > 102400)
+		return -EINVAL;
+	ftier_report_tier_state(&s);
+	return count;
+}
+static struct kobj_attribute tier_report_attr = __ATTR_WO(tier_report);
+
+static ssize_t level_off_show(struct kobject *kobj,
+			      struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(ftier_ctx.level_off));
+}
+static struct kobj_attribute level_off_attr = __ATTR_RO(level_off);
+
+/*
+ * Tier membership. Both tiers must be non-empty sets of memory nodes and
+ * disjoint. The fault path reads the masks locklessly, so a concurrent
+ * update can briefly misclassify a node; nothing worse happens.
+ */
+static ssize_t nodes_store(nodemask_t *mask, const nodemask_t *other,
+			   const char *buf, size_t count)
+{
+	nodemask_t new;
+	int err;
+
+	err = nodelist_parse(buf, new);
+	if (err)
+		return err;
+	if (nodes_empty(new) || !nodes_subset(new, node_states[N_MEMORY]) ||
+	    nodes_intersects(new, *other))
+		return -EINVAL;
+	mutex_lock(&ftier_state_lock);
+	mutex_lock(&ftier_lock);
+	*mask = new;
+	mutex_unlock(&ftier_lock);
+	mutex_unlock(&ftier_state_lock);
+	return count;
+}
+
+static ssize_t dram_nodes_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%*pbl\n", nodemask_pr_args(&ftier_dram_nodes));
+}
+
+static ssize_t dram_nodes_store(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t count)
+{
+	return nodes_store(&ftier_dram_nodes, &ftier_cxl_nodes, buf, count);
+}
+static struct kobj_attribute dram_nodes_attr = __ATTR_RW(dram_nodes);
+
+static ssize_t cxl_nodes_show(struct kobject *kobj,
+			      struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%*pbl\n", nodemask_pr_args(&ftier_cxl_nodes));
+}
+
+static ssize_t cxl_nodes_store(struct kobject *kobj,
+			       struct kobj_attribute *attr,
+			       const char *buf, size_t count)
+{
+	return nodes_store(&ftier_cxl_nodes, &ftier_dram_nodes, buf, count);
+}
+static struct kobj_attribute cxl_nodes_attr = __ATTR_RW(cxl_nodes);
 
 /* Scanning is continuous since the AFS rework: kept for compatibility. */
 static int sysctl_fspin_ms = 5000;
@@ -375,6 +501,15 @@ static ssize_t stats_show(struct kobject *kobj,
 	S("nr_migrate_fail", st.nr_migrate_fail);
 	S("nr_protected", st.nr_protected);
 	S("nr_overrun", st.nr_overrun);
+	S("nr_rounds", st.nr_rounds);
+	S("nr_level_colder", st.nr_level_colder);
+	S("nr_level_hotter", st.nr_level_hotter);
+	S("nr_monitor_stale", st.nr_monitor_stale);
+	S("nr_hint_faults", atomic_long_read(&ftier_hint.nr_faults));
+	S("nr_hint_migrate", atomic_long_read(&ftier_hint.nr_migrate));
+	S("nr_hint_reject_tier", atomic_long_read(&ftier_hint.nr_reject_tier));
+	S("nr_hint_reject_lat", atomic_long_read(&ftier_hint.nr_reject_lat));
+	S("nr_hint_reject_rate", atomic_long_read(&ftier_hint.nr_reject_rate));
 #undef S
 	return len;
 }
@@ -431,6 +566,24 @@ static struct attribute *ftier_sysfs_attrs[] = {
 	&flush_tlb_attr.attr,
 	&migrate_batch_attr.attr,
 	&max_migrate_mbps_attr.attr,
+	&max_candidates_attr.attr,
+	&hint_mode_attr.attr,
+	&hint_min_ms_attr.attr,
+	&hint_max_ms_attr.attr,
+	&hint_pass_bp_attr.attr,
+	&hint_thresh_ms_attr.attr,
+	&level_adapt_attr.attr,
+	&level_period_ms_attr.attr,
+	&level_small_pct_attr.attr,
+	&level_full_pct_attr.attr,
+	&level_jump_pct_attr.attr,
+	&level_progress_pct_attr.attr,
+	&level_deadband_pm_attr.attr,
+	&level_off_attr.attr,
+	&tier_report_attr.attr,
+	&monitor_timeout_ms_attr.attr,
+	&dram_nodes_attr.attr,
+	&cxl_nodes_attr.attr,
 	&stats_attr.attr,
 	&hotlist_attr.attr,
 	NULL,
@@ -445,6 +598,8 @@ static int __init ftier_sysfs_init(void)
 	struct kobject *ftier_kobj;
 	int err;
 
+	ftier_nodes_init();
+
 	ftier_kobj = kobject_create_and_add("ftier", mm_kobj);
 	if (!ftier_kobj)
 		return -ENOMEM;
@@ -456,4 +611,5 @@ static int __init ftier_sysfs_init(void)
 	}
 	return err;
 }
-subsys_initcall(ftier_sysfs_init);
+/* After the memory tiers are set up. */
+late_initcall(ftier_sysfs_init);

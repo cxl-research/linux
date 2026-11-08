@@ -87,14 +87,15 @@ static void hot_unlink(struct ftier_hotlist *hl, struct ftier_hot *hot)
  * @count: access count reported for the last interval (scaled)
  *
  * Adds @count to the effective hotness of the entry, creating it if it
- * is not tracked yet, and moves it to the bucket of its new level.
+ * is not tracked yet, and moves it to the tail of the bucket of its new
+ * level. An entry staying at its level keeps its place in the bucket.
  */
 void ftier_hotlist_add(struct ftier_hotlist *hl, struct ftier_pud *pud,
 		       unsigned int idx, u32 count)
 {
 	struct ftier_hot *hot = pud->hot[idx];
+	unsigned int pos, old_pos = FTIER_HOT_LEVELS;
 	u32 h = 0;
-	unsigned int pos;
 
 	if (!count)
 		return;
@@ -110,14 +111,26 @@ void ftier_hotlist_add(struct ftier_hotlist *hl, struct ftier_pud *pud,
 		hl->nr_inserted++;
 	} else {
 		h = ftier_hot_effective(hl, hot);
-		hot_unlink(hl, hot);
+		old_pos = hot_pos(hot);
 	}
 
 	hot->hotness = h > U32_MAX - count ? U32_MAX : h + count;
 	hot->epoch = (u16)hl->epoch;
 	pos = hot_pos(hot);
-	list_add(&hot->link, &hl->bucket[pos]);
+	if (pos == old_pos)
+		return;
+	if (old_pos < FTIER_HOT_LEVELS) {
+		list_del(&hot->link);
+		hl->nr[old_pos]--;
+	}
+	list_add_tail(&hot->link, &hl->bucket[pos]);
 	hl->nr[pos]++;
+}
+
+/* Move @hot behind the other entries of its level. */
+void ftier_hotlist_rotate(struct ftier_hotlist *hl, struct ftier_hot *hot)
+{
+	list_move_tail(&hot->link, &hl->bucket[hot_pos(hot)]);
 }
 
 void ftier_hotlist_remove(struct ftier_hotlist *hl, struct ftier_hot *hot)

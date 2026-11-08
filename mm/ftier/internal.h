@@ -48,6 +48,31 @@ struct ftier_config {
 	unsigned int flush_tlb;		/* enum ftier_flush_tlb */
 	unsigned int migrate_batch;
 	unsigned int max_migrate_mbps;	/* global migration-rate cap */
+	unsigned int max_candidates;	/* Hotlist entries per tick */
+
+	/* hint-fault filter */
+	unsigned int hint_mode;		/* enum ftier_hint_mode */
+	unsigned int hint_min_ms;	/* bounds of the 1/h threshold */
+	unsigned int hint_max_ms;	/* also the fixed threshold */
+	unsigned int hint_pass_bp;	/* histogram mode pass ratio */
+
+	/* adaptive hotness level of migration candidates */
+	bool level_adapt;
+	unsigned int level_period_ms;
+	unsigned int level_small_pct;	/* "little" migration, % of cap */
+	unsigned int level_full_pct;	/* "near the cap", % of cap */
+	unsigned int level_jump_pct;	/* large gap change, % of gap */
+	unsigned int level_progress_pct; /* sufficient gap reduction */
+	unsigned int level_deadband_pm;	/* gap below this is converged */
+
+	unsigned int monitor_timeout_ms; /* 0: trust promote_mb forever */
+};
+
+enum ftier_hint_mode {
+	FTIER_HINT_MEDIAN,		/* 1/h of the round's median h */
+	FTIER_HINT_FIXED,		/* hint_max_ms */
+	FTIER_HINT_HISTOGRAM,		/* pre-rework pass-ratio filter */
+	FTIER_HINT_MODE_MAX = FTIER_HINT_HISTOGRAM,
 };
 
 /*
@@ -66,6 +91,8 @@ enum ftier_flush_tlb {
 
 extern struct ftier_config ftier_cfg;
 #define FTIER_CFG(field)	READ_ONCE(ftier_cfg.field)
+
+#define FTIER_MAX_CANDIDATES	1024
 
 /* Hotlist entry: one tracked PMD entry, i.e. a 2MB region. 32 bytes. */
 struct ftier_hot {
@@ -167,6 +194,28 @@ struct ftier_stats {
 	u64 nr_migrate_fail;		/* pages */
 	u64 nr_protected;		/* PTEs made PROT_NONE */
 	u64 nr_overrun;			/* ticks exceeding tick_ms */
+	u64 nr_rounds;			/* hint-fault migration rounds */
+	u64 nr_level_colder;
+	u64 nr_level_hotter;
+	u64 nr_monitor_stale;		/* ticks idled for a stale monitor */
+};
+
+/* Hint-fault state shared with the fault path: lock-free. */
+struct ftier_hint {
+	atomic_long_t credit;		/* pages the fault path may move */
+	int thresh_ms;			/* current latency threshold */
+	atomic_long_t nr_faults;
+	atomic_long_t nr_migrate;	/* faults allowed to migrate */
+	atomic_long_t nr_reject_tier;	/* folio not on the source tier */
+	atomic_long_t nr_reject_lat;	/* latency above threshold */
+	atomic_long_t nr_reject_rate;	/* rate cap exhausted */
+};
+
+/* Latest tier measurement from a monitor (ftier_report_tier_state). */
+struct ftier_tier_state {
+	spinlock_t lock;
+	struct ftier_tier_sample sample;
+	u64 time_ns;			/* 0: never reported */
 };
 
 struct ftier_ctx {
@@ -191,10 +240,22 @@ struct ftier_ctx {
 	u64 ival_end_ns;
 	bool tiering;
 
+	/* candidate selection, owned by the main thread */
+	unsigned int level_off;		/* levels below the hottest one */
+	int gap_prev;			/* signed tier imbalance, per mille */
+	u64 level_next_ns;
+	unsigned long level_pages;	/* moved since the last adaptation */
+	u64 round_end_ns;		/* current hint-fault round */
+	u64 tier_ival_end_ns;		/* migration volume interval */
+	unsigned long ival_target;	/* pages to move this interval */
+	unsigned long ival_done;
+
 	struct ftier_stats stats;
 };
 
 extern struct ftier_ctx ftier_ctx;
+extern struct ftier_hint ftier_hint;
+extern struct ftier_tier_state ftier_tier;
 extern struct mutex ftier_lock;
 extern struct mutex ftier_state_lock;
 extern enum ftier_status sysctl_ftier_status;
@@ -222,6 +283,7 @@ void ftier_hotlist_init(struct ftier_hotlist *hl);
 void ftier_hotlist_add(struct ftier_hotlist *hl, struct ftier_pud *pud,
 		       unsigned int idx, u32 count);
 void ftier_hotlist_remove(struct ftier_hotlist *hl, struct ftier_hot *hot);
+void ftier_hotlist_rotate(struct ftier_hotlist *hl, struct ftier_hot *hot);
 void ftier_hotlist_cool(struct ftier_hotlist *hl);
 void ftier_hotlist_destroy(struct ftier_hotlist *hl);
 u32 ftier_hot_effective(const struct ftier_hotlist *hl,
@@ -248,5 +310,15 @@ static inline unsigned long ftier_hot_addr(const struct ftier_hot *hot)
 
 /* tiering.c */
 void ftier_tier_tick(unsigned int tick_ms, u64 budget_ns);
+void ftier_tier_reset(void);
+
+/* hint.c */
+void ftier_hint_reset(void);
+void ftier_hint_set_thresh(int ms);
+void ftier_hint_refill(long pages, long max);
+void ftier_hint_age(void);
+
+/* nodes */
+int ftier_nodes_init(void);
 
 #endif /* _MM_FTIER_INTERNAL_H */
