@@ -56,6 +56,7 @@ reset() {
 	w max_migrate_mbps 1024
 	w flush_tlb ${FLUSH:-0}
 	w hint_mode median
+	w max_candidates 256
 	w hint_min_ms 1
 	w hint_max_ms 1000
 	w level_adapt 1
@@ -81,7 +82,7 @@ t_sysfs() {
 		 promote_mb migrate_batch hint_fault_latency_threshold_ms \
 		 scans_per_interval interval_ms tick_ms stats hotlist \
 		 min_pmds_per_fscan max_fhot_pc fspin_ms max_candidates \
-		 hint_mode hint_min_ms hint_max_ms hint_pass_bp hint_thresh_ms \
+		 residency_epochs hint_mode hint_min_ms hint_max_ms hint_pass_bp hint_thresh_ms \
 		 level_adapt level_period_ms level_off monitor_timeout_ms \
 		 dram_nodes cxl_nodes; do
 		[ -r $F/$a ] || { ok=0; echo "missing $a"; }
@@ -142,12 +143,15 @@ t_tracking() {
 	kill $HPID 2>/dev/null; wait $HPID 2>/dev/null
 }
 
-t_promote() {	# $1 = mode, $2 = hint_mode
+t_promote() {	# $1 = mode, $2 = hint_mode, $3 = max_candidates
 	reset
 	w ftier_tiering_mode $1
 	w hint_fault_latency_threshold_ms 1000
 	[ -n "$2" ] && w hint_mode $2
 	name=$1${2:+_$2}
+	# Fewer candidates per round than hot regions: rounds must not
+	# keep revisiting regions already moved.
+	[ -n "$3" ] && { w max_candidates $3; name=${name}_cand$3; }
 	start_hot_pg /tmp/prom-$name.log -s $SIZE -H $HOTMB -o 256 -t 40 -b $SLOW
 	set -- $name $(last_share /tmp/prom-$name.log)
 	before=$2
@@ -414,7 +418,7 @@ t_dmesg() {
 	fi
 }
 
-TESTS=${TESTS:-"sysfs invalid tracking promote_demand promote_hint promote_hint_fixed promote_hint_hist demote nodes level monitor cgroup exit trace cha churn dmesg"}
+TESTS=${TESTS:-"sysfs invalid tracking promote_demand promote_hint promote_hint_fixed promote_hint_hist promote_hint_fewcand promote_demand_fewcand demote nodes level monitor cgroup exit trace cha churn dmesg"}
 for t in $TESTS; do
 	echo "=== $t"
 	case $t in
@@ -422,6 +426,8 @@ for t in $TESTS; do
 	promote_hint) t_promote hint_fault ;;
 	promote_hint_fixed) t_promote hint_fault fixed ;;
 	promote_hint_hist) t_promote hint_fault histogram ;;
+	promote_hint_fewcand) t_promote hint_fault fixed 8 ;;
+	promote_demand_fewcand) t_promote demand_migrate "" 8 ;;
 	churn) t_churn ${CHURN:-300} ;;
 	*) t_$t ;;
 	esac

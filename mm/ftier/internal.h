@@ -48,7 +48,8 @@ struct ftier_config {
 	unsigned int flush_tlb;		/* enum ftier_flush_tlb */
 	unsigned int migrate_batch;
 	unsigned int max_migrate_mbps;	/* global migration-rate cap */
-	unsigned int max_candidates;	/* Hotlist entries per tick */
+	unsigned int max_candidates;	/* regions to move per tick */
+	unsigned int residency_epochs;	/* lifetime of residency flags */
 
 	/* hint-fault filter */
 	unsigned int hint_mode;		/* enum ftier_hint_mode */

@@ -320,6 +320,7 @@ FTIER_BOOL_ATTR(track_thp, track_thp);
 FTIER_BOOL_ATTR(notify_secondary, notify_secondary);
 FTIER_CFG_ATTR(flush_tlb, flush_tlb, 0, FTIER_FLUSH_MAX, true);
 FTIER_CFG_ATTR(max_candidates, max_candidates, 1, FTIER_MAX_CANDIDATES, true);
+FTIER_CFG_ATTR(residency_epochs, residency_epochs, 0, 30, true);
 FTIER_CFG_ATTR(hint_min_ms, hint_min_ms, 1, 60000, true);
 FTIER_CFG_ATTR(hint_max_ms, hint_max_ms, 1, 60000, true);
 FTIER_CFG_ATTR(hint_pass_bp, hint_pass_bp, 0, 10000, true);
@@ -567,6 +568,7 @@ static struct attribute *ftier_sysfs_attrs[] = {
 	&migrate_batch_attr.attr,
 	&max_migrate_mbps_attr.attr,
 	&max_candidates_attr.attr,
+	&residency_epochs_attr.attr,
 	&hint_mode_attr.attr,
 	&hint_min_ms_attr.attr,
 	&hint_max_ms_attr.attr,
